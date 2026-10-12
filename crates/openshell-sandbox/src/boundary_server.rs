@@ -7017,6 +7017,150 @@ mod linux {
             );
         }
 
+        /// Planned handoff: the candidate says hello and fences while the
+        /// previous owner is still connected and healthy (it has not processed
+        /// its release yet). The runtime must issue the challenge, fence the
+        /// live owner, freeze, and resume the same process on activation; the
+        /// owner's late disconnect must not disturb the new owner.
+        #[test]
+        fn planned_handoff_fences_a_still_connected_owner() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_PLANNED_HANDOFF_CHILD";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                let status = std::process::Command::new(
+                    std::env::current_exe().expect("current test executable"),
+                )
+                .args([
+                    "--exact",
+                    "boundary_server::linux::tests::planned_handoff_fences_a_still_connected_owner",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .expect("run isolated planned handoff test");
+                assert!(status.success(), "isolated planned handoff test failed");
+                return;
+            }
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let fixture = recovery_fixture(
+                process_runtime.handle().clone(),
+                "sandbox-handoff",
+                Duration::from_secs(3),
+            );
+            let runtime = &fixture.runtime;
+            let policy = SandboxPolicyWire::from(openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy::default(),
+            });
+            let owner_instance = test_supervisor_instance_id();
+            let owner = fixture.principal();
+            assert!(matches!(
+                runtime.attach(policy.clone()),
+                Response::Attached { .. }
+            ));
+            runtime
+                .commit_attach(&owner, owner_instance)
+                .expect("attach owner");
+            assert!(matches!(runtime.confirm(), Response::Confirmed { .. }));
+            runtime.commit_confirm(&owner).expect("confirm owner");
+            let Response::Started { process_id, .. } = runtime.start_agent(
+                "sandbox-handoff".to_string(),
+                AgentSpecWire {
+                    program: "/bin/sleep".to_string(),
+                    args: vec!["60".to_string()],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                },
+                policy,
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("start agent");
+            };
+            let process = runtime.current_process().expect("running process");
+            assert!(process.boundary_runtime.is_active());
+            assert!(matches!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Connected(_)
+            ));
+
+            // The candidate connects while the owner is still connected: the
+            // hello succeeds (no frozen runtime required) and fencing freezes
+            // the workload and closes the owner.
+            let candidate = Candidate::new();
+            let candidate_principal = fixture.principal();
+            let Response::Recovered {
+                receipt,
+                main_process_id,
+                ..
+            } = fixture.recover(&candidate_principal, &candidate, 2)
+            else {
+                panic!("expected recovered while the owner was connected");
+            };
+            assert_eq!(main_process_id.as_deref(), Some(process_id.as_str()));
+            assert!(
+                !process.boundary_runtime.is_active(),
+                "frozen during the handoff"
+            );
+            assert!(
+                runtime
+                    .authorize_request(&owner, &Request::OpenMediation)
+                    .is_err(),
+                "the fenced owner can no longer act"
+            );
+
+            // The owner's release arrives late, after the fence.
+            runtime.transport_disconnected(owner.connection_id());
+
+            runtime
+                .commit_attach(&candidate_principal, candidate.instance)
+                .expect("candidate attach");
+            let activation = fixture.authority(
+                openshell_core::jwt::SupervisorAuthorityKind::Activation,
+                2,
+                &candidate.instance.to_string(),
+                None,
+                None,
+                Some(openshell_core::jwt::recovery_receipt_digest(&receipt)),
+            );
+            assert!(matches!(
+                runtime.handle_supervisor_recovery(
+                    &candidate_principal,
+                    Request::ConfirmRecovery {
+                        activation: activation.token.expose_secret().to_string(),
+                    },
+                ),
+                Response::Confirmed { .. }
+            ));
+            assert!(
+                process.boundary_runtime.is_active(),
+                "same workload resumes"
+            );
+            assert!(process.exit_status().is_none());
+            assert_eq!(
+                runtime
+                    .current_process()
+                    .map(|process| process.process_id()),
+                Some(process_id)
+            );
+            // A stray late disconnect of the old owner changes nothing.
+            runtime.transport_disconnected(owner.connection_id());
+            assert!(process.boundary_runtime.is_active());
+            assert_eq!(
+                process_runtime.block_on(runtime.terminate_boundary()),
+                Response::BoundaryTerminated
+            );
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn concurrent_recovery_candidates_cannot_both_take_ownership() {
             let fixture = recovery_fixture(

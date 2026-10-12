@@ -867,6 +867,41 @@ service OpenShell {
       auth_mode: "unauthenticated"
     };
   }
+
+  // Shared supervisor pool status: the elected assignment coordinator, pool
+  // members (live, draining, sessions), and durable pool operations. Served
+  // by every gateway replica.
+  rpc GetSupervisorPoolStatus(GetSupervisorPoolStatusRequest)
+      returns (GetSupervisorPoolStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+      global_role: "platform_admin"
+    };
+  }
+
+  // Request a durable drain of one pool member or an explicit rebalance.
+  // Any gateway records the request; the elected coordinator executes it
+  // with fenced handoffs that preserve running workloads.
+  rpc StartSupervisorPoolOperation(StartSupervisorPoolOperationRequest)
+      returns (StartSupervisorPoolOperationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      global_role: "platform_admin"
+    };
+  }
+
+  // Cancel a drain or rebalance. In-flight handoffs finish; a cancelled
+  // drain returns its member to service.
+  rpc CancelSupervisorPoolOperation(CancelSupervisorPoolOperationRequest)
+      returns (CancelSupervisorPoolOperationResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      global_role: "platform_admin"
+    };
+  }
 }
 
 // What a pool replica must do for one assigned sandbox.
@@ -878,8 +913,12 @@ enum SupervisorAssignmentAction {
   SUPERVISOR_ASSIGNMENT_ACTION_RECOVER = 2;
   // Keep supervising (already active on this replica).
   SUPERVISOR_ASSIGNMENT_ACTION_SUPERVISE = 3;
-  // Stop supervising; the sandbox stopped, was deleted, or ownership moved.
+  // Stop supervising and stop the workload: the sandbox stopped or was deleted.
   SUPERVISOR_ASSIGNMENT_ACTION_RELEASE = 4;
+  // Release ownership for a planned handoff WITHOUT stopping the workload:
+  // stop acting for the sandbox and drop its runtime connection so another
+  // replica can fence and resume the same workload.
+  SUPERVISOR_ASSIGNMENT_ACTION_RELINQUISH = 5;
 }
 
 message SupervisorPoolAssignment {
@@ -964,6 +1003,121 @@ message RenewSupervisorLeaseRequest {
 message RenewSupervisorLeaseResponse {
   string lease = 1 [(openshell.options.v1.secret) = true];
   google.protobuf.Duration lease_ttl = 2;
+}
+
+// Kind of a durable supervisor pool operation.
+enum SupervisorPoolOperationKind {
+  SUPERVISOR_POOL_OPERATION_KIND_UNSPECIFIED = 0;
+  // Place a new sandbox launch on a pool member (coordinator-initiated).
+  SUPERVISOR_POOL_OPERATION_KIND_ASSIGN = 1;
+  // Fenced recovery after an owner was lost (coordinator-initiated).
+  SUPERVISOR_POOL_OPERATION_KIND_RECOVER = 2;
+  // Move every session off one member and keep it out of placement.
+  SUPERVISOR_POOL_OPERATION_KIND_DRAIN = 3;
+  // Move sessions until member loads differ by at most one.
+  SUPERVISOR_POOL_OPERATION_KIND_REBALANCE = 4;
+}
+
+enum SupervisorPoolOperationPhase {
+  SUPERVISOR_POOL_OPERATION_PHASE_UNSPECIFIED = 0;
+  SUPERVISOR_POOL_OPERATION_PHASE_PENDING = 1;
+  SUPERVISOR_POOL_OPERATION_PHASE_RUNNING = 2;
+  // Cannot progress now (for example no eligible capacity); retried.
+  SUPERVISOR_POOL_OPERATION_PHASE_BLOCKED = 3;
+  SUPERVISOR_POOL_OPERATION_PHASE_SUCCEEDED = 4;
+  SUPERVISOR_POOL_OPERATION_PHASE_FAILED = 5;
+  SUPERVISOR_POOL_OPERATION_PHASE_CANCELLED = 6;
+}
+
+// One planned session move of a drain or rebalance.
+message SupervisorPoolSessionMove {
+  string sandbox = 1;
+  string from_member = 2;
+  string to_member = 3;
+  // releasing, reserved, done, skipped, or failed.
+  string state = 4;
+  string message = 5;
+}
+
+message SupervisorPoolOperation {
+  // Operation identifier, used by CancelSupervisorPoolOperation.
+  string name = 1;
+  SupervisorPoolOperationKind kind = 2;
+  SupervisorPoolOperationPhase phase = 3;
+  // Progress, or the reason the operation is blocked or failed.
+  string message = 4;
+  google.protobuf.Timestamp created_time = 5;
+  google.protobuf.Timestamp updated_time = 6;
+  // Set once the operation reached a terminal phase.
+  google.protobuf.Timestamp finished_time = 7;
+  // Assign/recover: the sandbox.
+  string sandbox = 8;
+  // Drain: the member being drained. Assign/recover: the target member.
+  string member = 9;
+  uint32 max_parallel = 10;
+  repeated SupervisorPoolSessionMove moves = 11;
+  bool cancel_requested = 12;
+  // Coordinator term that last advanced the operation.
+  uint64 coordinator_term = 13;
+  // Recover: candidates reserved so far.
+  uint32 attempts = 14;
+  // Recover: the fixed recovery deadline.
+  google.protobuf.Timestamp deadline = 15;
+  string requested_by = 16;
+}
+
+message SupervisorPoolCoordinator {
+  // Unique gateway process identity holding the coordinator lease.
+  string holder = 1;
+  uint64 term = 2;
+  google.protobuf.Timestamp expiration_time = 3;
+  // True if the lease has expired and no gateway has taken over yet.
+  bool expired = 4;
+}
+
+message SupervisorPoolMember {
+  string name = 1;
+  // Recently synced with a gateway.
+  bool live = 2;
+  // Cordoned by a non-cancelled drain.
+  bool draining = 3;
+  google.protobuf.Timestamp last_seen_time = 4;
+  // Sessions owned or being taken over by this member.
+  uint32 sessions = 5;
+}
+
+message GetSupervisorPoolStatusRequest {}
+
+message GetSupervisorPoolStatusResponse {
+  // Unset if no gateway has ever held the coordinator lease.
+  SupervisorPoolCoordinator coordinator = 1;
+  repeated SupervisorPoolMember members = 2;
+  // Oldest first.
+  repeated SupervisorPoolOperation operations = 3;
+  // Replica identity of the gateway that served this request.
+  string serving_gateway = 4;
+}
+
+message StartSupervisorPoolOperationRequest {
+  // SUPERVISOR_POOL_OPERATION_KIND_DRAIN or _REBALANCE.
+  SupervisorPoolOperationKind kind = 1;
+  // Drain only: the pool member to drain.
+  string member = 2;
+  // Maximum concurrent handoffs, 1-8. Omitted means 1.
+  optional uint32 max_parallel = 3;
+}
+
+message StartSupervisorPoolOperationResponse {
+  SupervisorPoolOperation operation = 1;
+}
+
+message CancelSupervisorPoolOperationRequest {
+  // Operation name from SupervisorPoolOperation.name.
+  string name = 1;
+}
+
+message CancelSupervisorPoolOperationResponse {
+  SupervisorPoolOperation operation = 1;
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the

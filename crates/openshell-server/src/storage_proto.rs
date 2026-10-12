@@ -147,7 +147,7 @@ mod tests {
     // one enum for pool RPCs; assignments use the generic object store, so no
     // durable protobuf types change.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "54bbcda1ef6f47a9a9684301516161a1107e52666c4927ee17260e6a116a0990";
+        "b66f48682fcd609b1f4ef64180e8777d49be0dee1893d466b710ae63ea84c1a9";
     const DURABLE_SCHEMA_SHA256: &str =
         "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -196,8 +196,11 @@ mod tests {
     // Gateway supervisor topology prototype: shared pool membership,
     // assignments, and supervisor-recovery.v1 authority. Pool members
     // authenticate in the handler; nothing here is persisted from the wire.
-    const SUPERVISOR_POOL_RPC_SIGNATURES: [&str; 5] = [
+    const SUPERVISOR_POOL_RPC_SIGNATURES: [&str; 8] = [
         "openshell.v1.OpenShell/ActivateSupervisorAssignment|.openshell.v1.ActivateSupervisorAssignmentRequest|.openshell.v1.ActivateSupervisorAssignmentResponse|false|false",
+        "openshell.v1.OpenShell/CancelSupervisorPoolOperation|.openshell.v1.CancelSupervisorPoolOperationRequest|.openshell.v1.CancelSupervisorPoolOperationResponse|false|false",
+        "openshell.v1.OpenShell/GetSupervisorPoolStatus|.openshell.v1.GetSupervisorPoolStatusRequest|.openshell.v1.GetSupervisorPoolStatusResponse|false|false",
+        "openshell.v1.OpenShell/StartSupervisorPoolOperation|.openshell.v1.StartSupervisorPoolOperationRequest|.openshell.v1.StartSupervisorPoolOperationResponse|false|false",
         "openshell.v1.OpenShell/GetSupervisorAssignment|.openshell.v1.GetSupervisorAssignmentRequest|.openshell.v1.GetSupervisorAssignmentResponse|false|false",
         "openshell.v1.OpenShell/RenewSupervisorLease|.openshell.v1.RenewSupervisorLeaseRequest|.openshell.v1.RenewSupervisorLeaseResponse|false|false",
         "openshell.v1.OpenShell/RequestSupervisorRecoveryGrant|.openshell.v1.RequestSupervisorRecoveryGrantRequest|.openshell.v1.RequestSupervisorRecoveryGrantResponse|false|false",
@@ -638,7 +641,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (322, 28),
+                (332, 30),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

@@ -13,6 +13,11 @@
 //! - killing the supervisor Pod that owns a sandbox freezes and then resumes
 //!   the *same* agent process (same PID, same workload Pod, counter continues)
 //!   on the surviving replica, with policy and credential isolation intact;
+//! - pausing the elected assignment coordinator gateway hands coordination
+//!   to the other gateway with a higher term while every healthy agent keeps
+//!   running; the resumed gateway stays a follower;
+//! - a drain and an explicit rebalance through the operator API move
+//!   sessions with fenced handoffs that keep the same agent processes;
 //! - deleting a sandbox while its recovery is pending wins, and never removes
 //!   the shared Deployment or disturbs other sandboxes.
 
@@ -432,6 +437,572 @@ async fn delete_provider(name: &str) {
     let _ = cli(&["provider", "delete", name]).await;
 }
 
+/// Minimal client for the supervisor pool operator API. Messages mirror the
+/// fields of `proto/openshell.proto` the test reads; unknown fields are
+/// ignored by prost.
+mod pool_api {
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct Timestamp {
+        #[prost(int64, tag = "1")]
+        pub seconds: i64,
+        #[prost(int32, tag = "2")]
+        pub nanos: i32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct Empty {}
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SessionMove {
+        #[prost(string, tag = "1")]
+        pub sandbox: String,
+        #[prost(string, tag = "2")]
+        pub from_member: String,
+        #[prost(string, tag = "3")]
+        pub to_member: String,
+        #[prost(string, tag = "4")]
+        pub state: String,
+        #[prost(string, tag = "5")]
+        pub message: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct Operation {
+        #[prost(string, tag = "1")]
+        pub name: String,
+        #[prost(int32, tag = "2")]
+        pub kind: i32,
+        #[prost(int32, tag = "3")]
+        pub phase: i32,
+        #[prost(string, tag = "4")]
+        pub message: String,
+        #[prost(string, tag = "9")]
+        pub member: String,
+        #[prost(message, repeated, tag = "11")]
+        pub moves: Vec<SessionMove>,
+        #[prost(uint64, tag = "13")]
+        pub coordinator_term: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct Coordinator {
+        #[prost(string, tag = "1")]
+        pub holder: String,
+        #[prost(uint64, tag = "2")]
+        pub term: u64,
+        #[prost(message, optional, tag = "3")]
+        pub expiration_time: Option<Timestamp>,
+        #[prost(bool, tag = "4")]
+        pub expired: bool,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct Member {
+        #[prost(string, tag = "1")]
+        pub name: String,
+        #[prost(bool, tag = "2")]
+        pub live: bool,
+        #[prost(bool, tag = "3")]
+        pub draining: bool,
+        #[prost(uint32, tag = "5")]
+        pub sessions: u32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct Status {
+        #[prost(message, optional, tag = "1")]
+        pub coordinator: Option<Coordinator>,
+        #[prost(message, repeated, tag = "2")]
+        pub members: Vec<Member>,
+        #[prost(message, repeated, tag = "3")]
+        pub operations: Vec<Operation>,
+        #[prost(string, tag = "4")]
+        pub serving_gateway: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct StartRequest {
+        #[prost(int32, tag = "1")]
+        pub kind: i32,
+        #[prost(string, tag = "2")]
+        pub member: String,
+        #[prost(uint32, optional, tag = "3")]
+        pub max_parallel: Option<u32>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct OperationResponse {
+        #[prost(message, optional, tag = "1")]
+        pub operation: Option<Operation>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct CancelRequest {
+        #[prost(string, tag = "1")]
+        pub name: String,
+    }
+
+    pub const KIND_DRAIN: i32 = 3;
+    pub const KIND_REBALANCE: i32 = 4;
+    pub const PHASE_SUCCEEDED: i32 = 4;
+    pub const PHASE_FAILED: i32 = 5;
+    pub const PHASE_CANCELLED: i32 = 6;
+
+    async fn unary<Req, Resp>(
+        endpoint: &str,
+        method: &'static str,
+        request: Req,
+    ) -> Result<Resp, String>
+    where
+        Req: Message + Send + Sync + 'static,
+        Resp: Message + Default + Send + Sync + 'static,
+    {
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+            .map_err(|error| error.to_string())?
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .map_err(|error| format!("connect {endpoint}: {error}"))?;
+        let mut grpc = tonic::client::Grpc::new(channel);
+        grpc.ready().await.map_err(|error| error.to_string())?;
+        let path = tonic::codegen::http::uri::PathAndQuery::from_static(method);
+        grpc.unary(
+            tonic::Request::new(request),
+            path,
+            tonic_prost::ProstCodec::<Req, Resp>::default(),
+        )
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| format!("{method}: {status}"))
+    }
+
+    pub async fn status(endpoint: &str) -> Result<Status, String> {
+        unary(
+            endpoint,
+            "/openshell.v1.OpenShell/GetSupervisorPoolStatus",
+            Empty {},
+        )
+        .await
+    }
+
+    pub async fn start(endpoint: &str, kind: i32, member: &str) -> Result<Operation, String> {
+        let response: OperationResponse = unary(
+            endpoint,
+            "/openshell.v1.OpenShell/StartSupervisorPoolOperation",
+            StartRequest {
+                kind,
+                member: member.to_string(),
+                max_parallel: Some(1),
+            },
+        )
+        .await?;
+        response
+            .operation
+            .ok_or_else(|| "no operation returned".to_string())
+    }
+
+    pub async fn cancel(endpoint: &str, name: &str) -> Result<Operation, String> {
+        let response: OperationResponse = unary(
+            endpoint,
+            "/openshell.v1.OpenShell/CancelSupervisorPoolOperation",
+            CancelRequest {
+                name: name.to_string(),
+            },
+        )
+        .await?;
+        response
+            .operation
+            .ok_or_else(|| "no operation returned".to_string())
+    }
+}
+
+/// `kubectl port-forward` to one gateway Pod; killed on drop.
+struct PortForward {
+    _child: tokio::process::Child,
+    endpoint: String,
+}
+
+impl Kube {
+    async fn gateway_pods(&self) -> Result<Vec<String>, String> {
+        let pods = self
+            .json(&["get", "pods", "-l", "app.kubernetes.io/name=openshell"])
+            .await?;
+        Ok(pods["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pod| pod["metadata"]["deletionTimestamp"].is_null())
+            .filter_map(|pod| pod["metadata"]["name"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    async fn port_forward(&self, pod: &str) -> Result<PortForward, String> {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut child = Command::new("kubectl")
+            .args(["--context", &self.context, "-n", &self.namespace])
+            .args(["port-forward", &format!("pod/{pod}"), ":8080"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("spawn port-forward: {error}"))?;
+        let stdout = child.stdout.take().ok_or("port-forward stdout")?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let line = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
+            .await
+            .map_err(|_| "port-forward did not start".to_string())?
+            .map_err(|error| error.to_string())?
+            .ok_or("port-forward exited")?;
+        // "Forwarding from 127.0.0.1:43123 -> 8080"
+        let port = line
+            .split("127.0.0.1:")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .ok_or_else(|| format!("unexpected port-forward output: {line}"))?
+            .to_string();
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        Ok(PortForward {
+            _child: child,
+            endpoint: format!("http://127.0.0.1:{port}"),
+        })
+    }
+
+    async fn workload_pod(&self, sandbox_id: &str) -> Result<String, String> {
+        let pods = self
+            .json(&[
+                "get",
+                "pods",
+                "-l",
+                &format!(
+                    "openshell.ai/boundary-pair={},openshell.ai/boundary-role=workload",
+                    sandbox_id.to_ascii_lowercase()
+                ),
+            ])
+            .await?;
+        pods["items"][0]["metadata"]["name"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("workload Pod for {sandbox_id} not found"))
+    }
+
+    /// Read the agent's PID and counter directly in its workload Pod, without
+    /// any gateway or supervisor on the path.
+    async fn agent_state_direct(&self, sandbox_id: &str) -> Result<AgentState, String> {
+        let pod = self.workload_pod(sandbox_id).await?;
+        let output = self
+            .run(&[
+                "exec",
+                &pod,
+                "--",
+                "sh",
+                "-c",
+                "echo PID=$(cat /tmp/agent.pid) COUNTER=$(cat /tmp/agent.counter)",
+            ])
+            .await?;
+        let field = |key: &str| {
+            output
+                .split_whitespace()
+                .find_map(|token| token.strip_prefix(key))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        };
+        match (field("PID="), field("COUNTER=")) {
+            (Some(pid), Some(counter)) => Ok(AgentState { pid, counter }),
+            _ => Err(format!("agent state unavailable in {pod}: {output}")),
+        }
+    }
+}
+
+async fn wait_for_operation(
+    endpoint: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<(pool_api::Operation, Duration), String> {
+    let started = Instant::now();
+    loop {
+        let status = pool_api::status(endpoint).await;
+        if let Ok(status) = &status
+            && let Some(operation) = status.operations.iter().find(|op| op.name == name)
+            && matches!(
+                operation.phase,
+                pool_api::PHASE_SUCCEEDED | pool_api::PHASE_FAILED | pool_api::PHASE_CANCELLED
+            )
+        {
+            return Ok((operation.clone(), started.elapsed()));
+        }
+        if started.elapsed() > timeout {
+            return Err(format!("operation {name} did not finish: {status:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Host PID (in the node) of the gateway process in `pod`.
+async fn gateway_host_pid(node: &str, pod: &str) -> Result<u32, String> {
+    let output = node_shell(
+        node,
+        &format!(
+            "crictl inspect -o go-template --template '{{{{.info.pid}}}}' $(crictl ps --name openshell-gateway --label io.kubernetes.pod.name={pod} -q)"
+        ),
+    )
+    .await?;
+    let pid: u32 = output
+        .trim()
+        .parse()
+        .map_err(|error| format!("parse gateway pid from {output:?}: {error}"))?;
+    if pid <= 1 {
+        return Err(format!("refusing to signal node pid {pid}"));
+    }
+    Ok(pid)
+}
+
+/// Pause the elected coordinator gateway and prove that (1) another gateway
+/// takes over with a higher term, (2) every healthy agent keeps running
+/// without a freeze or an ownership change, (3) the resumed gateway stays a
+/// follower.
+#[allow(clippy::too_many_lines)]
+async fn coordinator_pause_phase(kube: &Kube, sandbox_ids: &[&str]) {
+    let gateways = kube.gateway_pods().await.unwrap();
+    assert_eq!(gateways.len(), 2, "two gateway replicas: {gateways:?}");
+    let probe = kube.port_forward(&gateways[0]).await.unwrap();
+    let status = pool_api::status(&probe.endpoint).await.unwrap();
+    let coordinator = status.coordinator.expect("a coordinator is elected");
+    let coordinator_pod = coordinator.holder.split('/').next().unwrap().to_string();
+    assert!(gateways.contains(&coordinator_pod), "{coordinator:?}");
+    let follower = gateways
+        .iter()
+        .find(|pod| **pod != coordinator_pod)
+        .unwrap();
+    drop(probe);
+    let api = kube.port_forward(follower).await.unwrap();
+    let mut owners = Vec::new();
+    let mut before = Vec::new();
+    for id in sandbox_ids {
+        owners.push(kube.owner_of(id).await.unwrap());
+        before.push(kube.agent_state_direct(id).await.unwrap());
+    }
+
+    let node = node_container(&kube.context);
+    let pid = gateway_host_pid(&node, &coordinator_pod).await.unwrap();
+    let paused_at = Instant::now();
+    node_shell(&node, &format!("kill -STOP {pid}"))
+        .await
+        .unwrap();
+    let mut failover = None;
+    let mut last = before.clone();
+    let mut max_gap = Duration::ZERO;
+    let mut last_progress = vec![Instant::now(); sandbox_ids.len()];
+    // Longer than the 5 s coordinator TTL, shorter than the gateway liveness
+    // probe budget (3 x 5 s) so the paused process is not restarted.
+    while paused_at.elapsed() < Duration::from_secs(11) {
+        if failover.is_none()
+            && let Ok(status) = pool_api::status(&api.endpoint).await
+            && let Some(current) = status.coordinator
+            && current.term > coordinator.term
+            && !current.holder.starts_with(&coordinator_pod)
+        {
+            failover = Some((paused_at.elapsed(), current));
+        }
+        for (index, id) in sandbox_ids.iter().enumerate() {
+            let state = kube.agent_state_direct(id).await.unwrap();
+            assert_eq!(
+                state.pid, before[index].pid,
+                "the agent process never changed"
+            );
+            if state.counter > last[index].counter {
+                max_gap = max_gap.max(last_progress[index].elapsed());
+                last_progress[index] = Instant::now();
+                last[index] = state;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    for progress in &last_progress {
+        max_gap = max_gap.max(progress.elapsed());
+    }
+    node_shell(&node, &format!("kill -CONT {pid}"))
+        .await
+        .unwrap();
+    let (failover_after, new_coordinator) =
+        failover.expect("another gateway became coordinator while the old one was paused");
+    eprintln!(
+        "METRIC coordinator_pause old={} term={} new={} term={} failover_ms={} max_agent_counter_gap_ms={} counters_before={:?} counters_after={:?}",
+        coordinator.holder,
+        coordinator.term,
+        new_coordinator.holder,
+        new_coordinator.term,
+        failover_after.as_millis(),
+        max_gap.as_millis(),
+        before.iter().map(|s| s.counter).collect::<Vec<_>>(),
+        last.iter().map(|s| s.counter).collect::<Vec<_>>()
+    );
+    assert!(
+        max_gap < Duration::from_secs(4),
+        "healthy agents must not freeze while the coordinator changes (max gap {max_gap:?})"
+    );
+    for (index, id) in sandbox_ids.iter().enumerate() {
+        assert!(
+            last[index].counter >= before[index].counter + 7,
+            "{id} kept running"
+        );
+        assert_eq!(
+            kube.owner_of(id).await.unwrap(),
+            owners[index],
+            "a coordinator change never moves a healthy assignment"
+        );
+    }
+    // The resumed gateway discovers it lost the lease and stays a follower.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let status = pool_api::status(&api.endpoint).await.unwrap();
+    let current = status.coordinator.unwrap();
+    assert_eq!(current.holder, new_coordinator.holder);
+    let mut logs = kube
+        .run(&["logs", &coordinator_pod])
+        .await
+        .unwrap_or_default();
+    logs.push_str(
+        &kube
+            .run(&["logs", &coordinator_pod, "--previous"])
+            .await
+            .unwrap_or_default(),
+    );
+    let stepped_down = logs
+        .lines()
+        .rev()
+        .find(|line| line.contains("stepping down") && line.contains("coordinator"));
+    eprintln!("METRIC coordinator_pause old_coordinator_reaction={stepped_down:?}");
+    assert!(
+        stepped_down.is_some(),
+        "the paused coordinator stepped down when it resumed"
+    );
+}
+
+/// Drain the busiest replica, then cancel the drain and rebalance; every
+/// handoff preserves the agent process.
+#[allow(clippy::too_many_lines)]
+async fn drain_and_rebalance_phase(kube: &Kube, sandboxes: &[(&str, &str)], port: u16) {
+    let gateways = kube.gateway_pods().await.unwrap();
+    let api = kube.port_forward(&gateways[0]).await.unwrap();
+    let mut before = Vec::new();
+    let mut workload_uids = Vec::new();
+    for (_, id) in sandboxes {
+        before.push(kube.agent_state_direct(id).await.unwrap());
+        workload_uids.push(kube.workload_pod_uid(id).await.unwrap());
+    }
+    let status = pool_api::status(&api.endpoint).await.unwrap();
+    let busiest = status
+        .members
+        .iter()
+        .filter(|m| m.live)
+        .max_by_key(|m| m.sessions)
+        .unwrap()
+        .clone();
+    eprintln!("METRIC drain members_before={:?}", status.members);
+
+    let drain = pool_api::start(&api.endpoint, pool_api::KIND_DRAIN, &busiest.name)
+        .await
+        .unwrap();
+    let (drained, took) = wait_for_operation(&api.endpoint, &drain.name, Duration::from_secs(180))
+        .await
+        .unwrap();
+    eprintln!(
+        "METRIC drain member={} sessions={} phase={} took_ms={} moves={:?}",
+        busiest.name,
+        busiest.sessions,
+        drained.phase,
+        took.as_millis(),
+        drained.moves
+    );
+    assert_eq!(
+        drained.phase,
+        pool_api::PHASE_SUCCEEDED,
+        "{}",
+        drained.message
+    );
+    assert_eq!(drained.moves.len(), busiest.sessions as usize);
+    assert!(
+        drained.moves.iter().all(|m| m.state == "done"),
+        "{:?}",
+        drained.moves
+    );
+    let status = pool_api::status(&api.endpoint).await.unwrap();
+    let drained_member = status
+        .members
+        .iter()
+        .find(|m| m.name == busiest.name)
+        .unwrap();
+    assert!(drained_member.draining);
+    assert_eq!(drained_member.sessions, 0);
+    for (index, (name, id)) in sandboxes.iter().enumerate() {
+        assert_ne!(
+            kube.owner_of(id).await.unwrap(),
+            busiest.name,
+            "{name} moved off"
+        );
+        let (state, _) = wait_for_agent(name, RECOVERY_TIMEOUT).await.unwrap();
+        assert_eq!(
+            state.pid, before[index].pid,
+            "{name}: same agent process after drain"
+        );
+        assert!(state.counter > before[index].counter);
+        assert_eq!(
+            kube.workload_pod_uid(id).await.unwrap(),
+            workload_uids[index]
+        );
+    }
+    assert_isolation("after-drain", sandboxes[0].0, sandboxes[1].0, port).await;
+
+    // Return the member to service and rebalance.
+    let cancelled = pool_api::cancel(&api.endpoint, &drain.name).await.unwrap();
+    assert_eq!(cancelled.phase, pool_api::PHASE_CANCELLED);
+    let rebalance = pool_api::start(&api.endpoint, pool_api::KIND_REBALANCE, "")
+        .await
+        .unwrap();
+    let (balanced, took) =
+        wait_for_operation(&api.endpoint, &rebalance.name, Duration::from_secs(180))
+            .await
+            .unwrap();
+    let status = pool_api::status(&api.endpoint).await.unwrap();
+    let mut loads: Vec<u32> = status
+        .members
+        .iter()
+        .filter(|m| m.live)
+        .map(|m| m.sessions)
+        .collect();
+    loads.sort_unstable();
+    eprintln!(
+        "METRIC rebalance phase={} took_ms={} moves={:?} loads={loads:?}",
+        balanced.phase,
+        took.as_millis(),
+        balanced.moves
+    );
+    assert_eq!(
+        balanced.phase,
+        pool_api::PHASE_SUCCEEDED,
+        "{}",
+        balanced.message
+    );
+    assert!(
+        loads.last().unwrap() - loads.first().unwrap() <= 1,
+        "balanced: {loads:?}"
+    );
+    for (index, (name, id)) in sandboxes.iter().enumerate() {
+        let (state, _) = wait_for_agent(name, RECOVERY_TIMEOUT).await.unwrap();
+        assert_eq!(
+            state.pid, before[index].pid,
+            "{name}: same agent process after rebalance"
+        );
+        assert_eq!(
+            kube.workload_pod_uid(id).await.unwrap(),
+            workload_uids[index]
+        );
+    }
+    assert_isolation("after-rebalance", sandboxes[0].0, sandboxes[1].0, port).await;
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn shared_supervisor_pool_resumes_running_agents_after_owner_loss() {
@@ -499,6 +1070,33 @@ async fn shared_supervisor_pool_resumes_running_agents_after_owner_loss() {
     );
 
     assert_isolation("before-takeover", &sandbox_a.name, &sandbox_b.name, port).await;
+
+    // The elected assignment coordinator pauses: another gateway takes over
+    // and no healthy agent freezes.
+    coordinator_pause_phase(&kube, &[&id_a, &id_b, &id_c]).await;
+
+    // Planned movement: drain the busiest replica, then rebalance.
+    drain_and_rebalance_phase(
+        &kube,
+        &[
+            (&sandbox_a.name, &id_a),
+            (&sandbox_b.name, &id_b),
+            (&sandbox_c.name, &id_c),
+        ],
+        port,
+    )
+    .await;
+
+    // Drain and rebalance moved sessions: re-read who owns what.
+    let owners = [
+        kube.owner_of(&id_a).await.unwrap(),
+        kube.owner_of(&id_b).await.unwrap(),
+        kube.owner_of(&id_c).await.unwrap(),
+    ];
+    eprintln!(
+        "METRIC owners_after_rebalance a={} b={} c={}",
+        owners[0], owners[1], owners[2]
+    );
 
     // Kill the replica that owns sandbox A, as a crash would.
     let victim = owners[0].clone();

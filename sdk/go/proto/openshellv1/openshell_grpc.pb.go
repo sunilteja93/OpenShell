@@ -111,6 +111,9 @@ const (
 	OpenShell_RequestSupervisorRecoveryGrant_FullMethodName = "/openshell.v1.OpenShell/RequestSupervisorRecoveryGrant"
 	OpenShell_ActivateSupervisorAssignment_FullMethodName   = "/openshell.v1.OpenShell/ActivateSupervisorAssignment"
 	OpenShell_RenewSupervisorLease_FullMethodName           = "/openshell.v1.OpenShell/RenewSupervisorLease"
+	OpenShell_GetSupervisorPoolStatus_FullMethodName        = "/openshell.v1.OpenShell/GetSupervisorPoolStatus"
+	OpenShell_StartSupervisorPoolOperation_FullMethodName   = "/openshell.v1.OpenShell/StartSupervisorPoolOperation"
+	OpenShell_CancelSupervisorPoolOperation_FullMethodName  = "/openshell.v1.OpenShell/CancelSupervisorPoolOperation"
 )
 
 // OpenShellClient is the client API for OpenShell service.
@@ -354,6 +357,17 @@ type OpenShellClient interface {
 	ActivateSupervisorAssignment(ctx context.Context, in *ActivateSupervisorAssignmentRequest, opts ...grpc.CallOption) (*ActivateSupervisorAssignmentResponse, error)
 	// Renew the current owner's enforced lease.
 	RenewSupervisorLease(ctx context.Context, in *RenewSupervisorLeaseRequest, opts ...grpc.CallOption) (*RenewSupervisorLeaseResponse, error)
+	// Shared supervisor pool status: the elected assignment coordinator, pool
+	// members (live, draining, sessions), and durable pool operations. Served
+	// by every gateway replica.
+	GetSupervisorPoolStatus(ctx context.Context, in *GetSupervisorPoolStatusRequest, opts ...grpc.CallOption) (*GetSupervisorPoolStatusResponse, error)
+	// Request a durable drain of one pool member or an explicit rebalance.
+	// Any gateway records the request; the elected coordinator executes it
+	// with fenced handoffs that preserve running workloads.
+	StartSupervisorPoolOperation(ctx context.Context, in *StartSupervisorPoolOperationRequest, opts ...grpc.CallOption) (*StartSupervisorPoolOperationResponse, error)
+	// Cancel a drain or rebalance. In-flight handoffs finish; a cancelled
+	// drain returns its member to service.
+	CancelSupervisorPoolOperation(ctx context.Context, in *CancelSupervisorPoolOperationRequest, opts ...grpc.CallOption) (*CancelSupervisorPoolOperationResponse, error)
 }
 
 type openShellClient struct {
@@ -1280,6 +1294,36 @@ func (c *openShellClient) RenewSupervisorLease(ctx context.Context, in *RenewSup
 	return out, nil
 }
 
+func (c *openShellClient) GetSupervisorPoolStatus(ctx context.Context, in *GetSupervisorPoolStatusRequest, opts ...grpc.CallOption) (*GetSupervisorPoolStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSupervisorPoolStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSupervisorPoolStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) StartSupervisorPoolOperation(ctx context.Context, in *StartSupervisorPoolOperationRequest, opts ...grpc.CallOption) (*StartSupervisorPoolOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartSupervisorPoolOperationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_StartSupervisorPoolOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) CancelSupervisorPoolOperation(ctx context.Context, in *CancelSupervisorPoolOperationRequest, opts ...grpc.CallOption) (*CancelSupervisorPoolOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelSupervisorPoolOperationResponse)
+	err := c.cc.Invoke(ctx, OpenShell_CancelSupervisorPoolOperation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // OpenShellServer is the server API for OpenShell service.
 // All implementations must embed UnimplementedOpenShellServer
 // for forward compatibility.
@@ -1521,6 +1565,17 @@ type OpenShellServer interface {
 	ActivateSupervisorAssignment(context.Context, *ActivateSupervisorAssignmentRequest) (*ActivateSupervisorAssignmentResponse, error)
 	// Renew the current owner's enforced lease.
 	RenewSupervisorLease(context.Context, *RenewSupervisorLeaseRequest) (*RenewSupervisorLeaseResponse, error)
+	// Shared supervisor pool status: the elected assignment coordinator, pool
+	// members (live, draining, sessions), and durable pool operations. Served
+	// by every gateway replica.
+	GetSupervisorPoolStatus(context.Context, *GetSupervisorPoolStatusRequest) (*GetSupervisorPoolStatusResponse, error)
+	// Request a durable drain of one pool member or an explicit rebalance.
+	// Any gateway records the request; the elected coordinator executes it
+	// with fenced handoffs that preserve running workloads.
+	StartSupervisorPoolOperation(context.Context, *StartSupervisorPoolOperationRequest) (*StartSupervisorPoolOperationResponse, error)
+	// Cancel a drain or rebalance. In-flight handoffs finish; a cancelled
+	// drain returns its member to service.
+	CancelSupervisorPoolOperation(context.Context, *CancelSupervisorPoolOperationRequest) (*CancelSupervisorPoolOperationResponse, error)
 	mustEmbedUnimplementedOpenShellServer()
 }
 
@@ -1794,6 +1849,15 @@ func (UnimplementedOpenShellServer) ActivateSupervisorAssignment(context.Context
 }
 func (UnimplementedOpenShellServer) RenewSupervisorLease(context.Context, *RenewSupervisorLeaseRequest) (*RenewSupervisorLeaseResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RenewSupervisorLease not implemented")
+}
+func (UnimplementedOpenShellServer) GetSupervisorPoolStatus(context.Context, *GetSupervisorPoolStatusRequest) (*GetSupervisorPoolStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSupervisorPoolStatus not implemented")
+}
+func (UnimplementedOpenShellServer) StartSupervisorPoolOperation(context.Context, *StartSupervisorPoolOperationRequest) (*StartSupervisorPoolOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartSupervisorPoolOperation not implemented")
+}
+func (UnimplementedOpenShellServer) CancelSupervisorPoolOperation(context.Context, *CancelSupervisorPoolOperationRequest) (*CancelSupervisorPoolOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelSupervisorPoolOperation not implemented")
 }
 func (UnimplementedOpenShellServer) mustEmbedUnimplementedOpenShellServer() {}
 func (UnimplementedOpenShellServer) testEmbeddedByValue()                   {}
@@ -3320,6 +3384,60 @@ func _OpenShell_RenewSupervisorLease_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_GetSupervisorPoolStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSupervisorPoolStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSupervisorPoolStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSupervisorPoolStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSupervisorPoolStatus(ctx, req.(*GetSupervisorPoolStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_StartSupervisorPoolOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartSupervisorPoolOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).StartSupervisorPoolOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_StartSupervisorPoolOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).StartSupervisorPoolOperation(ctx, req.(*StartSupervisorPoolOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_CancelSupervisorPoolOperation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelSupervisorPoolOperationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).CancelSupervisorPoolOperation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_CancelSupervisorPoolOperation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).CancelSupervisorPoolOperation(ctx, req.(*CancelSupervisorPoolOperationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // OpenShell_ServiceDesc is the grpc.ServiceDesc for OpenShell service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -3646,6 +3764,18 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RenewSupervisorLease",
 			Handler:    _OpenShell_RenewSupervisorLease_Handler,
+		},
+		{
+			MethodName: "GetSupervisorPoolStatus",
+			Handler:    _OpenShell_GetSupervisorPoolStatus_Handler,
+		},
+		{
+			MethodName: "StartSupervisorPoolOperation",
+			Handler:    _OpenShell_StartSupervisorPoolOperation_Handler,
+		},
+		{
+			MethodName: "CancelSupervisorPoolOperation",
+			Handler:    _OpenShell_CancelSupervisorPoolOperation_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

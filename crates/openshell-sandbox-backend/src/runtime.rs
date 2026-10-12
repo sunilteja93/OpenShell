@@ -130,11 +130,73 @@ struct RecoveredBoundary {
 }
 
 /// Fence the previous owner through the runtime's recovery extension.
+/// How long a candidate keeps retrying `RecoveryHello` before giving up.
+/// The hello is retried BEFORE any grant is requested, so a transient
+/// failure (e.g. racing a relinquishing owner's connection teardown) never
+/// consumes the reserved epoch's single grant.
+const RECOVERY_HELLO_RETRY_BUDGET: Duration = Duration::from_secs(4);
+const RECOVERY_HELLO_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const RECOVERY_HELLO_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+async fn recovery_hello(client: &BoundaryClient) -> Result<Response, BackendError> {
+    retry_within_budget(
+        RECOVERY_HELLO_RETRY_BUDGET,
+        RECOVERY_HELLO_ATTEMPT_TIMEOUT,
+        RECOVERY_HELLO_RETRY_INTERVAL,
+        || client.call_once(Request::RecoveryHello),
+    )
+    .await
+}
+
+/// Retry `attempt` on transient failures until `budget` is spent. Every
+/// attempt is bounded by the smaller of `attempt_timeout` and the time left,
+/// and no attempt or wait starts past the deadline, so the whole call never
+/// exceeds `budget`. A response or a definitive refusal (denied, terminated,
+/// unsupported) is returned immediately.
+async fn retry_within_budget<F, Fut>(
+    budget: Duration,
+    attempt_timeout: Duration,
+    retry_interval: Duration,
+    attempt: F,
+) -> Result<Response, BackendError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<Response, BackendError>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let attempt_deadline = (tokio::time::Instant::now() + attempt_timeout).min(deadline);
+        let result = tokio::time::timeout_at(attempt_deadline, attempt())
+            .await
+            .unwrap_or_else(|_| {
+                Err(BackendError::Unavailable(
+                    "recovery hello timed out".to_string(),
+                ))
+            });
+        match result {
+            // A response, or a definitive refusal, is final.
+            Ok(response) => return Ok(response),
+            Err(
+                error @ (BackendError::Denied(_)
+                | BackendError::Terminated(_)
+                | BackendError::Unsupported(_)),
+            ) => return Err(error),
+            Err(error) => {
+                if tokio::time::Instant::now() + retry_interval >= deadline {
+                    return Err(error);
+                }
+                tracing::debug!(%error, "Recovery hello failed; retrying before requesting a grant");
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
+}
+
 async fn recover_boundary(
     client: &BoundaryClient,
     ownership: &SupervisorOwnership,
 ) -> Result<RecoveredBoundary, BackendError> {
-    let response = client.call_once(Request::RecoveryHello).await?;
+    let response = recovery_hello(client).await?;
     let Response::RecoveryChallenge {
         protocol,
         challenge,
@@ -3918,5 +3980,63 @@ mod tests {
         // The server observes the client's fatal alert and may fail its accept;
         // completing the task is sufficient for this rejection test.
         let _ = server.await;
+    }
+}
+
+#[cfg(test)]
+mod recovery_hello_tests {
+    use super::{BackendError, Response, retry_within_budget};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const BUDGET: Duration = Duration::from_secs(4);
+    const ATTEMPT: Duration = Duration::from_millis(1_500);
+    const INTERVAL: Duration = Duration::from_millis(250);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_runtime_never_exceeds_the_hello_budget() {
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result = retry_within_budget(BUDGET, ATTEMPT, INTERVAL, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<Response, BackendError>>()
+        })
+        .await;
+        assert!(matches!(result, Err(BackendError::Unavailable(_))));
+        assert!(
+            started.elapsed() <= BUDGET,
+            "hello took {:?}, budget {BUDGET:?}",
+            started.elapsed()
+        );
+        // 1.5 s + 0.25 s + 1.5 s + 0.25 s + remaining 0.5 s: the last attempt
+        // is cut to the time left instead of a full 1.5 s.
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_failures_are_retried_and_definitive_ones_are_not() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_within_budget(BUDGET, ATTEMPT, INTERVAL, || {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(BackendError::Unavailable("connection refused".to_string()))
+                } else {
+                    Ok(Response::MediationReady)
+                }
+            }
+        })
+        .await;
+        assert!(matches!(result, Ok(Response::MediationReady)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        let denied_attempts = AtomicUsize::new(0);
+        let denied = retry_within_budget(BUDGET, ATTEMPT, INTERVAL, || {
+            denied_attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(BackendError::Terminated("terminating".to_string())) }
+        })
+        .await;
+        assert!(matches!(denied, Err(BackendError::Terminated(_))));
+        assert_eq!(denied_attempts.load(Ordering::SeqCst), 1);
     }
 }

@@ -3,6 +3,7 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+pub mod coordinator;
 mod legacy_time_wire;
 mod postgres;
 #[cfg(test)]
@@ -60,6 +61,10 @@ pub enum PersistenceError {
     Conflict {
         current_resource_version: Option<u64>,
     },
+    /// A fenced write was attempted by a coordinator that no longer holds
+    /// the coordinator lease term it was granted.
+    #[error("coordinator lease term is no longer held by this writer")]
+    Fenced,
 }
 
 impl PersistenceError {
@@ -69,7 +74,10 @@ impl PersistenceError {
     /// a race is how [`crate::compute::lease`] learns the lease is held, and a
     /// version conflict is what drives an optimistic-concurrency retry.
     pub fn is_expected(&self) -> bool {
-        matches!(self, Self::UniqueViolation { .. } | Self::Conflict { .. })
+        matches!(
+            self,
+            Self::UniqueViolation { .. } | Self::Conflict { .. } | Self::Fenced
+        )
     }
 
     pub fn unique_violation(constraint: Option<String>, detail: Option<String>) -> Self {

@@ -1699,3 +1699,337 @@ fn row_to_draft_chunk_record(row: sqlx::postgres::PgRow) -> PersistenceResult<Dr
         updated_at_ms,
     )
 }
+
+// ---------------------------------------------------------------------------
+// Coordinator leases and fenced writes (see `super::coordinator`).
+// ---------------------------------------------------------------------------
+
+use super::coordinator::{CoordinatorFence, CoordinatorLease, FencedOp, FencedResult};
+
+fn coordinator_lease_from_row(row: &sqlx::postgres::PgRow) -> CoordinatorLease {
+    let term: i64 = row.try_get("term").unwrap_or(0);
+    CoordinatorLease {
+        holder: row.try_get("holder").unwrap_or_default(),
+        term: term.max(0).cast_unsigned(),
+        expires_at_ms: row.try_get("expires_at_ms").unwrap_or(0),
+    }
+}
+
+fn term_param(term: u64) -> i64 {
+    i64::try_from(term).unwrap_or(i64::MAX)
+}
+
+/// Lock the lease row (`FOR SHARE` or `FOR UPDATE`), then sample the
+/// database clock.
+///
+/// The clock must be read only after the lock is granted: `PostgreSQL`
+/// evaluates a `WHERE` predicate before waiting for a row lock and
+/// does not re-evaluate it when the blocking transaction released the row
+/// without modifying it, so `expires_at_ms > clock_timestamp()` inside a
+/// locking query could be judged with a pre-wait clock.
+#[derive(Clone, Copy)]
+enum LeaseLock {
+    /// Fenced writes: concurrent with each other, exclusive with takeover.
+    Share,
+    /// Acquisition and renewal.
+    Update,
+}
+
+async fn lock_lease_and_sample_clock(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    lease: &str,
+    lock: LeaseLock,
+) -> PersistenceResult<(Option<CoordinatorLease>, i64)> {
+    let query = match lock {
+        LeaseLock::Share => {
+            "SELECT holder, term, expires_at_ms FROM coordinator_leases WHERE name = $1 FOR SHARE"
+        }
+        LeaseLock::Update => {
+            "SELECT holder, term, expires_at_ms FROM coordinator_leases WHERE name = $1 FOR UPDATE"
+        }
+    };
+    let current = sqlx::query(query)
+        .bind(lease)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| map_db_error(&e))?
+        .map(|row| coordinator_lease_from_row(&row));
+    let db_now_ms: i64 =
+        sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+    Ok((current, db_now_ms))
+}
+
+fn holds_lease(current: Option<&CoordinatorLease>, fence: &CoordinatorFence, now_ms: i64) -> bool {
+    current.is_some_and(|current| {
+        current.holder == fence.holder && current.term == fence.term && !current.expired(now_ms)
+    })
+}
+
+impl PostgresStore {
+    /// Test support: hold the lease row lock in an open transaction without
+    /// changing it, to exercise lock waits.
+    #[cfg(test)]
+    pub(super) async fn lock_coordinator_lease_row(
+        &self,
+        lease: &str,
+    ) -> PersistenceResult<sqlx::Transaction<'static, Postgres>> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        sqlx::query("SELECT 1 FROM coordinator_leases WHERE name = $1 FOR UPDATE")
+            .bind(lease)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(tx)
+    }
+
+    pub async fn acquire_coordinator_lease(
+        &self,
+        lease: &str,
+        holder: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> PersistenceResult<Option<CoordinatorLease>> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        // FOR UPDATE waits for every in-flight fenced write holding the row
+        // FOR SHARE, so a takeover commits strictly after them. Expiry is
+        // judged no earlier than the database clock sampled after the lock.
+        let (current, db_now_ms) =
+            lock_lease_and_sample_clock(&mut tx, lease, LeaseLock::Update).await?;
+        let now_ms = now_ms.max(db_now_ms);
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+
+        let term = match current {
+            None => {
+                let inserted = sqlx::query(
+                    r"
+INSERT INTO coordinator_leases (name, holder, term, expires_at_ms, updated_at_ms)
+VALUES ($1, $2, 1, $3, $4)
+ON CONFLICT (name) DO NOTHING
+",
+                )
+                .bind(lease)
+                .bind(holder)
+                .bind(expires_at_ms)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+                if inserted.rows_affected() != 1 {
+                    // Another process created the row first.
+                    return Ok(None);
+                }
+                1
+            }
+            Some(current) if !current.expired(now_ms) => {
+                tx.commit().await.map_err(|e| map_db_error(&e))?;
+                return Ok((current.holder == holder).then_some(current));
+            }
+            Some(current) => {
+                let term = current.term + 1;
+                sqlx::query(
+                    r"
+UPDATE coordinator_leases
+SET holder = $2, term = $3, expires_at_ms = $4, updated_at_ms = $5
+WHERE name = $1
+",
+                )
+                .bind(lease)
+                .bind(holder)
+                .bind(term_param(term))
+                .bind(expires_at_ms)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+                term
+            }
+        };
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(Some(CoordinatorLease {
+            holder: holder.to_string(),
+            term,
+            expires_at_ms,
+        }))
+    }
+
+    pub async fn renew_coordinator_lease(
+        &self,
+        fence: &CoordinatorFence,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> PersistenceResult<bool> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let (current, db_now_ms) =
+            lock_lease_and_sample_clock(&mut tx, &fence.lease, LeaseLock::Update).await?;
+        let now_ms = now_ms.max(db_now_ms);
+        if !holds_lease(current.as_ref(), fence, now_ms) {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE coordinator_leases SET expires_at_ms = $2, updated_at_ms = $3 WHERE name = $1",
+        )
+        .bind(&fence.lease)
+        .bind(now_ms.saturating_add(ttl_ms))
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(true)
+    }
+
+    pub async fn release_coordinator_lease(
+        &self,
+        fence: &CoordinatorFence,
+        now_ms: i64,
+    ) -> PersistenceResult<bool> {
+        let result = sqlx::query(
+            r"
+UPDATE coordinator_leases
+SET expires_at_ms = 0, updated_at_ms = $4
+WHERE name = $1 AND holder = $2 AND term = $3
+",
+        )
+        .bind(&fence.lease)
+        .bind(&fence.holder)
+        .bind(term_param(fence.term))
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn get_coordinator_lease(
+        &self,
+        lease: &str,
+    ) -> PersistenceResult<Option<CoordinatorLease>> {
+        let row = sqlx::query(
+            "SELECT holder, term, expires_at_ms FROM coordinator_leases WHERE name = $1",
+        )
+        .bind(lease)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(row.map(|row| coordinator_lease_from_row(&row)))
+    }
+
+    pub async fn write_fenced(
+        &self,
+        fence: &CoordinatorFence,
+        now_ms: i64,
+        ops: &[FencedOp],
+    ) -> PersistenceResult<Vec<FencedResult>> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        // FOR SHARE blocks a concurrent takeover until this transaction ends.
+        // Holder, term and expiry are validated after the lock is granted,
+        // against max(caller clock, database clock sampled after the wait).
+        let (current, db_now_ms) =
+            lock_lease_and_sample_clock(&mut tx, &fence.lease, LeaseLock::Share).await?;
+        let holds_term = holds_lease(current.as_ref(), fence, now_ms.max(db_now_ms));
+        if !holds_term {
+            return Err(PersistenceError::Fenced);
+        }
+
+        let mut results = Vec::with_capacity(ops.len());
+        for op in ops {
+            let result = match op {
+                FencedOp::Put {
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                    labels,
+                    condition,
+                } => {
+                    let labels_jsonb: Option<serde_json::Value> = labels
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|e| {
+                            PersistenceError::Encode(format!("invalid labels JSON: {e}"))
+                        })?;
+                    let row = match condition {
+                        WriteCondition::MustCreate => sqlx::query(
+                            r"
+INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, COALESCE($7, '{}'::jsonb), 1)
+ON CONFLICT DO NOTHING
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                        )
+                        .bind(object_type)
+                        .bind(id)
+                        .bind(name)
+                        .bind(workspace)
+                        .bind(payload)
+                        .bind(now_ms)
+                        .bind(labels_jsonb)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| map_db_error(&e))?,
+                        WriteCondition::MatchResourceVersion(expected) => sqlx::query(
+                            r"
+UPDATE objects
+SET payload = $4, labels = COALESCE($5, '{}'::jsonb), updated_at_ms = $6, resource_version = resource_version + 1
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                        )
+                        .bind(object_type)
+                        .bind(id)
+                        .bind(i64::try_from(*expected).unwrap_or(i64::MAX))
+                        .bind(payload)
+                        .bind(labels_jsonb)
+                        .bind(now_ms)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| map_db_error(&e))?,
+                        WriteCondition::Unconditional => {
+                            return Err(PersistenceError::Encode(
+                                "fenced writes must be conditional".to_string(),
+                            ));
+                        }
+                    };
+                    let row = row.ok_or(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    })?;
+                    let version: i64 = row.try_get("resource_version").unwrap_or(1);
+                    Some(WriteResult {
+                        resource_version: version.max(1).cast_unsigned(),
+                        created_at_ms: row.get("created_at_ms"),
+                        updated_at_ms: row.get("updated_at_ms"),
+                    })
+                }
+                FencedOp::Delete {
+                    object_type,
+                    id,
+                    resource_version,
+                } => {
+                    let deleted = sqlx::query(
+                        "DELETE FROM objects WHERE object_type = $1 AND id = $2 AND resource_version = $3",
+                    )
+                    .bind(object_type)
+                    .bind(id)
+                    .bind(i64::try_from(*resource_version).unwrap_or(i64::MAX))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+                    if deleted.rows_affected() != 1 {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: None,
+                        });
+                    }
+                    None
+                }
+            };
+            results.push(result);
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(results)
+    }
+}

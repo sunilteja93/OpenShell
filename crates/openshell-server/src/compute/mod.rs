@@ -2324,10 +2324,39 @@ impl ComputeRuntime {
     /// Record that fenced supervisor recovery could not finish in time. The
     /// runtime terminates the frozen workload at its own deadline; this makes
     /// the outcome visible instead of silently restarting the sandbox.
-    pub(crate) async fn mark_supervisor_recovery_failed(&self, sandbox_id: &str, message: &str) {
+    /// Record a failed supervisor recovery, but only for the exact launch
+    /// that failed: a delayed call after the sandbox was restarted (new
+    /// generation or credential epoch) is ignored. The write is a CAS on the
+    /// sandbox version that was checked.
+    pub(crate) async fn mark_supervisor_recovery_failed_for_launch(
+        &self,
+        sandbox_id: &str,
+        runtime_generation: &str,
+        credential_epoch: u64,
+        message: &str,
+    ) {
         let Ok(Some(sandbox)) = self.store.get_message::<Sandbox>(sandbox_id).await else {
             return;
         };
+        let current = sandbox.metadata.as_ref().map(|metadata| {
+            (
+                metadata
+                    .annotations
+                    .get(crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION)
+                    .cloned(),
+                metadata
+                    .annotations
+                    .get(crate::auth::sandbox_session::AUTH_EPOCH_ANNOTATION)
+                    .and_then(|value| value.parse::<u64>().ok()),
+            )
+        });
+        if current != Some((Some(runtime_generation.to_string()), Some(credential_epoch))) {
+            info!(
+                sandbox_id,
+                "Skipping stale supervisor recovery failure for a previous launch"
+            );
+            return;
+        }
         if let Err(error) = self
             .write_lifecycle_phase(
                 &sandbox,

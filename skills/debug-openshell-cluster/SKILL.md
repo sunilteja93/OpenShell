@@ -970,8 +970,11 @@ kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei '
 When the rendered `gateway.toml` has `supervisor_topology = "gateway"` under
 `[openshell.gateway]`, sandboxes have no `os-supervisor-<id>` Pod. One shared
 `openshell-supervisor-pool` Deployment (two replicas, no owner reference) in
-the sandbox namespace supervises every sandbox; gateway logs record
-assignments, recovery reservations, and activations.
+the sandbox namespace supervises every sandbox. One gateway replica at a time
+is the elected assignment coordinator; its logs record placements, recovery
+reservations, drain and rebalance handoffs, and activations. Every gateway
+replica serves supervisor lease renewals, so check the coordinator only when
+placement, recovery, or an operation is stuck.
 
 ```bash
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep supervisor_topology
@@ -979,6 +982,7 @@ kubectl -n <sandbox-namespace> get deployment openshell-supervisor-pool -o wide
 kubectl -n <sandbox-namespace> get pods -l openshell.ai/component=supervisor-pool -o wide
 kubectl -n <sandbox-namespace> logs <pool-pod> --tail=200 | grep -E 'hosted supervisor session|abandon|self-fenc|lease'
 kubectl -n openshell logs -l app.kubernetes.io/name=openshell --tail=300 | grep -E 'supervisor assignment|shared supervisor|Reserved fenced|Activated supervisor recovery|Supervisor recovery failed'
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell --tail=500 | grep -E 'Elected supervisor pool assignment coordinator|coordinator .*stepping down|supervisor pool operation|planned supervisor handoff'
 for resource in deployments replicasets; do
   kubectl auth can-i get "$resource.apps" -n <sandbox-namespace> \
     --as system:serviceaccount:openshell:openshell
@@ -995,6 +999,18 @@ resumes them (normally within about 10 to 20 seconds). A sandbox in `Error`
 with reason `SupervisorRecoveryFailed` missed the 30-second runtime recovery
 window; the runtime already stopped its workload, so start it again explicitly.
 Sandbox deletion never deletes the shared Deployment.
+
+If no gateway logs `Elected supervisor pool assignment coordinator` recently,
+check gateway database connectivity: without a coordinator, new sandboxes stay
+unplaced and lost owners are not recovered, while running sandboxes continue.
+A coordinator that logs `stepping down` lost its lease (for example after a
+pause or a database stall) and another replica takes over within about 5
+seconds. Drain and rebalance requests (`StartSupervisorPoolOperation`, gateway
+API, `platform_admin`) run one at a time; `GetSupervisorPoolStatus` shows the
+coordinator, each replica's sessions and drain state, and every operation's
+phase and message. A drain refused with "would leave no eligible supervisor
+replica" needs another live replica first. A drained replica receives no
+sandboxes until its drain is cancelled.
 
 ### Step 7: Check VM-Backed Gateways
 

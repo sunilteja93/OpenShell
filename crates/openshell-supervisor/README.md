@@ -31,7 +31,19 @@ gateway assignments, and hosts each assigned sandbox through
 binds the session identity, OCSF context, and log-push sink, so attribution,
 tasks, and cleanup stay per sandbox. Gateway clients use a session-scoped
 endpoint whose credentials live only in that session; dropping the session
-revokes them. A `RELEASE` assignment (stop or delete) terminates the session;
-losing the assignment abandons it without touching the workload so the next
-owner can resume it. Process signals stop the replica, never a hosted
-workload.
+revokes them. A `RELEASE` assignment (stop or delete) terminates the session.
+A `RELINQUISH` assignment (planned drain or rebalance handoff) and losing the
+assignment both abandon the session without touching the workload so the next
+owner can resume it; a relinquished session keeps being reported in sync until
+its thread has stopped, which is how the gateway learns the release finished.
+Process signals stop the replica, never a hosted workload.
+
+Pool RPCs go through `PoolChannel`: each attempt has a 1.5-second deadline.
+Idempotent calls (sync, get assignment, lease renewal) reconnect and retry
+within a 4-second budget, with the reconnect itself bounded by that budget, so
+a hung gateway cannot starve an owner's lease renewal; a new connection is
+routed by the gateway Service to any healthy gateway. Recovery grants and
+activations are single bounded attempts because they commit single-use state:
+on failure the coordinator reserves a new epoch within the same recovery
+deadline. A recovering candidate retries `RecoveryHello` for up to 4 seconds
+before it requests a grant.

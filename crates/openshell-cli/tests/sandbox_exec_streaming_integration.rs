@@ -206,6 +206,30 @@ macro_rules! mock_gateway {
                 Err(tonic::Status::unimplemented("not implemented in test"))
             }
 
+            async fn get_supervisor_pool_status(
+                &self,
+                _request: tonic::Request<openshell_core::proto::GetSupervisorPoolStatusRequest>,
+            ) -> Result<tonic::Response<openshell_core::proto::GetSupervisorPoolStatusResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
+            async fn start_supervisor_pool_operation(
+                &self,
+                _request: tonic::Request<openshell_core::proto::StartSupervisorPoolOperationRequest>,
+            ) -> Result<tonic::Response<openshell_core::proto::StartSupervisorPoolOperationResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
+            async fn cancel_supervisor_pool_operation(
+                &self,
+                _request: tonic::Request<openshell_core::proto::CancelSupervisorPoolOperationRequest>,
+            ) -> Result<tonic::Response<openshell_core::proto::CancelSupervisorPoolOperationResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*

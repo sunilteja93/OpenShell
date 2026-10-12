@@ -14,11 +14,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::coordinator::FencedOp;
 use crate::persistence::{PersistenceError, Store, WriteCondition};
 
-const ASSIGNMENT_OBJECT_TYPE: &str = "supervisor_assignment";
+pub(crate) const ASSIGNMENT_OBJECT_TYPE: &str = "supervisor_assignment";
 
-fn assignment_object_id(sandbox_id: &str) -> String {
+pub(crate) fn assignment_object_id(sandbox_id: &str) -> String {
     format!("supervisor-assignment:{sandbox_id}")
 }
 
@@ -38,6 +39,10 @@ pub struct AssignmentTiming {
     pub attempt_budget_ms: i64,
     /// The runtime's authenticated reconnect window.
     pub runtime_recovery_window_ms: i64,
+    /// Bound for a planned handoff's release stage: how long the current
+    /// owner has to release ownership before the target is reserved anyway
+    /// (the runtime still fences a live previous owner).
+    pub release_budget_ms: i64,
 }
 
 impl AssignmentTiming {
@@ -48,6 +53,7 @@ impl AssignmentTiming {
         recovery_budget_ms: 16_000,
         attempt_budget_ms: 8_000,
         runtime_recovery_window_ms: 30_000,
+        release_budget_ms: 10_000,
     };
 
     /// Reject timing that could leave a frozen workload without a usable
@@ -68,6 +74,9 @@ impl AssignmentTiming {
         if self.attempt_budget_ms <= 0 || self.attempt_budget_ms > self.recovery_budget_ms {
             return Err("recovery attempt budget must fit inside the recovery budget".into());
         }
+        if self.release_budget_ms <= 0 {
+            return Err("planned handoff release budget must be positive".into());
+        }
         Ok(())
     }
 }
@@ -87,6 +96,20 @@ pub enum AssignmentState {
     Failed,
     /// Stop or delete won; no supervisor may act for this generation.
     Terminated,
+}
+
+/// A planned move of a healthy assignment (drain or rebalance).
+///
+/// While set, the current owner keeps its lease but is told to release
+/// ownership without terminating the workload; once it has released (or the
+/// release budget passed), the coordinator reserves the next epoch for the
+/// target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedHandoff {
+    pub target_member: String,
+    pub operation_id: String,
+    pub started_at_ms: i64,
+    pub release_deadline_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +138,15 @@ pub struct Assignment {
     pub failure_reason: Option<String>,
     #[serde(default)]
     pub recoveries: u64,
+    /// Pending planned handoff of an Active assignment.
+    #[serde(default)]
+    pub handoff: Option<PlannedHandoff>,
+    /// The current recovery was reserved for a planned move, not a failure.
+    #[serde(default)]
+    pub planned: bool,
+    /// Durable operation driving the current launch, recovery, or handoff.
+    #[serde(default)]
+    pub operation_id: Option<String>,
     /// Store version for compare-and-swap; not serialized.
     #[serde(skip)]
     pub resource_version: u64,
@@ -140,6 +172,10 @@ pub enum AssignmentError {
     GrantAlreadyIssued,
     #[error("supervisor instance does not match the activated owner")]
     InstanceMismatch,
+    #[error("a planned handoff is already in progress")]
+    HandoffInProgress,
+    #[error("no planned handoff is in progress")]
+    NoHandoff,
 }
 
 impl Assignment {
@@ -160,6 +196,9 @@ impl Assignment {
             grant_id: None,
             failure_reason: None,
             recoveries: 0,
+            handoff: None,
+            planned: false,
+            operation_id: None,
             resource_version: 0,
         }
     }
@@ -276,6 +315,79 @@ impl Assignment {
         next.owner_member = Some(candidate.to_string());
         next.owner_instance = None;
         next.grant_id = None;
+        next.handoff = None;
+        next.recovery_deadline_ms = Some(deadline);
+        next.attempt_expires_at_ms = Some((now_ms + timing.attempt_budget_ms).min(deadline));
+        Ok(next)
+    }
+
+    /// Start a planned handoff of a healthy Active assignment to `target`.
+    pub fn begin_handoff(
+        &self,
+        target: &str,
+        operation_id: &str,
+        now_ms: i64,
+        timing: &AssignmentTiming,
+    ) -> Result<Self, AssignmentError> {
+        self.check_live()?;
+        if self.state != AssignmentState::Active {
+            return Err(AssignmentError::WrongState);
+        }
+        if now_ms >= self.lease_expires_at_ms {
+            return Err(AssignmentError::LeaseExpired);
+        }
+        if self.handoff.is_some() {
+            return Err(AssignmentError::HandoffInProgress);
+        }
+        if self.owner_member.as_deref() == Some(target) {
+            return Err(AssignmentError::WrongState);
+        }
+        let mut next = self.clone();
+        next.handoff = Some(PlannedHandoff {
+            target_member: target.to_string(),
+            operation_id: operation_id.to_string(),
+            started_at_ms: now_ms,
+            release_deadline_ms: now_ms + timing.release_budget_ms,
+        });
+        Ok(next)
+    }
+
+    /// Abandon a planned handoff before its target was reserved.
+    pub fn cancel_handoff(&self) -> Result<Self, AssignmentError> {
+        if self.handoff.is_none() {
+            return Err(AssignmentError::NoHandoff);
+        }
+        let mut next = self.clone();
+        next.handoff = None;
+        Ok(next)
+    }
+
+    /// Reserve the next epoch for a planned handoff's target once the owner
+    /// released (or the release budget passed). Uses the same fenced
+    /// grant/receipt/activation protocol as failure recovery; the deadline
+    /// is anchored here and never extended by later candidates.
+    pub fn reserve_planned(
+        &self,
+        target: &str,
+        now_ms: i64,
+        timing: &AssignmentTiming,
+    ) -> Result<Self, AssignmentError> {
+        self.check_live()?;
+        if self.state != AssignmentState::Active {
+            return Err(AssignmentError::WrongState);
+        }
+        if self.handoff.is_none() {
+            return Err(AssignmentError::NoHandoff);
+        }
+        let deadline = now_ms + timing.recovery_budget_ms;
+        let mut next = self.clone();
+        next.state = AssignmentState::Recovering;
+        next.ownership_epoch += 1;
+        next.owner_member = Some(target.to_string());
+        next.owner_instance = None;
+        next.grant_id = None;
+        next.handoff = None;
+        next.planned = true;
         next.recovery_deadline_ms = Some(deadline);
         next.attempt_expires_at_ms = Some((now_ms + timing.attempt_budget_ms).min(deadline));
         Ok(next)
@@ -332,15 +444,22 @@ impl Assignment {
         next.lease_expires_at_ms = now_ms + timing.lease_ttl_ms;
         next.recovery_deadline_ms = None;
         next.attempt_expires_at_ms = None;
+        next.planned = false;
         next.recoveries += 1;
         Ok(next)
     }
 
-    /// Fail a recovery that missed its deadline, or a launch whose owner
+    /// Fail a recovery that missed its deadline, a lapsed owner for which no
+    /// eligible replica could be reserved in time, or a launch whose owner
     /// disappeared before it ever confirmed the boundary.
     #[must_use]
-    pub fn fail_if_overdue(&self, now_ms: i64) -> Option<Self> {
+    pub fn fail_if_overdue(&self, now_ms: i64, timing: &AssignmentTiming) -> Option<Self> {
         let reason = match self.state {
+            AssignmentState::Active
+                if now_ms >= self.lease_expires_at_ms + timing.recovery_budget_ms =>
+            {
+                "no eligible supervisor replica could recover the sandbox before its deadline"
+            }
             AssignmentState::Recovering
                 if self
                     .recovery_deadline_ms
@@ -356,15 +475,52 @@ impl Assignment {
         let mut next = self.clone();
         next.state = AssignmentState::Failed;
         next.failure_reason = Some(reason.to_string());
+        next.handoff = None;
         Some(next)
     }
 
-    /// Stop or delete wins over any pending launch or recovery.
+    /// Stop or delete wins over any pending launch, recovery, or handoff.
     #[must_use]
     pub fn terminate(&self) -> Self {
         let mut next = self.clone();
         next.state = AssignmentState::Terminated;
+        next.handoff = None;
         next
+    }
+
+    /// Whether the assignment holds (or is acquiring) supervision on a member.
+    #[must_use]
+    pub const fn occupies_owner(&self) -> bool {
+        matches!(
+            self.state,
+            AssignmentState::Launching | AssignmentState::Active | AssignmentState::Recovering
+        )
+    }
+
+    /// A fenced write of `self` replacing `expected` (or creating it).
+    pub fn fenced_write(&self, expected: Option<&Self>) -> Result<FencedOp, PersistenceError> {
+        Ok(FencedOp::Put {
+            object_type: ASSIGNMENT_OBJECT_TYPE.to_string(),
+            id: assignment_object_id(&self.sandbox_id),
+            name: self.sandbox_id.clone(),
+            workspace: String::new(),
+            payload: serde_json::to_vec(self)
+                .map_err(|error| PersistenceError::Encode(error.to_string()))?,
+            labels: None,
+            condition: expected.map_or(WriteCondition::MustCreate, |expected| {
+                WriteCondition::MatchResourceVersion(expected.resource_version)
+            }),
+        })
+    }
+
+    /// A fenced delete of this exact stored version.
+    #[must_use]
+    pub fn fenced_delete(&self) -> FencedOp {
+        FencedOp::Delete {
+            object_type: ASSIGNMENT_OBJECT_TYPE.to_string(),
+            id: assignment_object_id(&self.sandbox_id),
+            resource_version: self.resource_version,
+        }
     }
 
     /// The owner's lease lapsed and nobody reserved recovery yet.
@@ -568,7 +724,7 @@ mod tests {
         assert_eq!(retried.ownership_epoch, 3);
         assert_eq!(retried.recovery_deadline_ms, Some(deadline));
         assert!(retried.attempt_expires_at_ms.unwrap() <= deadline);
-        let failed = retried.fail_if_overdue(deadline).unwrap();
+        let failed = retried.fail_if_overdue(deadline, &T).unwrap();
         assert_eq!(failed.state, AssignmentState::Failed);
         assert!(matches!(
             failed.activate("replica-c", 3, "instance-c", deadline, &T),

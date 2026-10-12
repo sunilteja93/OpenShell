@@ -12,6 +12,10 @@
 //! - `LAUNCH`: own a fresh runtime generation.
 //! - `RECOVER`: fence the previous owner and resume its running workload.
 //! - `RELEASE`: the sandbox stopped or was deleted; terminate the session.
+//! - `RELINQUISH`: planned handoff (drain/rebalance); release ownership
+//!   without stopping the workload. The session is abandoned and keeps being
+//!   reported until its thread has fully stopped, which is how the gateway
+//!   learns the release completed.
 //! - Not listed: ownership moved away; abandon the session without touching
 //!   the workload so the new owner can resume it.
 
@@ -35,7 +39,7 @@ use openshell_sandbox_backend::ownership::{
     SupervisorOwnershipAuthority,
 };
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Worker threads per hosted session runtime.
 const SESSION_WORKER_THREADS: usize = 2;
@@ -57,10 +61,167 @@ pub struct PoolConfig {
     pub ready: Option<watch::Sender<bool>>,
 }
 
+/// Per-attempt deadline for pool RPCs. A hung (not dead) gateway must not
+/// stall an owner's lease renewal until HTTP/2 keepalive notices.
+const POOL_RPC_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Total budget for one pool RPC across reconnecting retries.
+const POOL_RPC_BUDGET: Duration = Duration::from_secs(4);
+
+/// Pool RPC client with per-attempt deadlines.
+///
+/// Idempotent calls (sync, get assignment, lease renewal) reconnect and retry
+/// on timeouts and transport failures within [`POOL_RPC_BUDGET`]; a new
+/// connection is routed by the gateway Service again, so they reach any
+/// healthy gateway. Grant and activation commit single-use durable state and
+/// are NOT retried: after a lost response a retry could turn a committed
+/// grant into "already issued" and strand a valid candidate. They get one
+/// bounded attempt; on failure the coordinator reserves a new epoch for
+/// another attempt within the original recovery deadline.
+#[derive(Clone, Debug)]
+pub(crate) struct PoolChannel {
+    endpoint: String,
+    token_file: PathBuf,
+    client: Arc<tokio::sync::RwLock<PoolMemberClient>>,
+}
+
+impl PoolChannel {
+    async fn connect(endpoint: &str, token_file: &Path) -> Result<Self> {
+        let client = connect_supervisor_pool(endpoint, token_file).await?;
+        Ok(Self {
+            endpoint: endpoint.to_string(),
+            token_file: token_file.to_path_buf(),
+            client: Arc::new(tokio::sync::RwLock::new(client)),
+        })
+    }
+
+    /// Replace the connection, bounded by `deadline` so a hanging connect
+    /// cannot outlive the caller's RPC budget.
+    async fn reconnect(&self, deadline: tokio::time::Instant) {
+        match tokio::time::timeout_at(
+            deadline,
+            connect_supervisor_pool(&self.endpoint, &self.token_file),
+        )
+        .await
+        {
+            Ok(Ok(client)) => *self.client.write().await = client,
+            Ok(Err(error)) => warn!(error = %error, "Supervisor pool reconnect failed"),
+            Err(_) => warn!("Supervisor pool reconnect timed out"),
+        }
+    }
+
+    /// One bounded attempt, for calls that commit single-use durable state.
+    /// On a transport failure the connection is replaced for later calls,
+    /// but the call itself is not repeated.
+    async fn call_once<T, F, Fut>(
+        &self,
+        what: &str,
+        call: F,
+    ) -> std::result::Result<T, tonic::Status>
+    where
+        F: FnOnce(PoolMemberClient) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
+        let client = self.client.read().await.clone();
+        run_once(what, POOL_RPC_ATTEMPT_TIMEOUT, call(client), |deadline| {
+            self.reconnect(deadline)
+        })
+        .await
+    }
+
+    /// Run an idempotent `call` with a per-attempt timeout, reconnecting and
+    /// retrying on timeouts and transport errors until the budget is spent.
+    /// Application errors (denied, failed precondition, ...) return
+    /// immediately.
+    async fn call<T, F, Fut>(&self, what: &str, call: F) -> std::result::Result<T, tonic::Status>
+    where
+        T: Send,
+        F: Fn(PoolMemberClient) -> Fut + Sync,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>> + Send,
+    {
+        run_idempotent(
+            what,
+            POOL_RPC_BUDGET,
+            POOL_RPC_ATTEMPT_TIMEOUT,
+            || async { call(self.client.read().await.clone()).await },
+            |deadline| self.reconnect(deadline),
+        )
+        .await
+    }
+}
+
+/// Single bounded attempt; on a transport failure, reconnect (bounded) for
+/// later calls and return the failure without repeating the call.
+async fn run_once<T, Fut, R, RFut>(
+    what: &str,
+    attempt_timeout: Duration,
+    attempt: Fut,
+    reconnect: R,
+) -> std::result::Result<T, tonic::Status>
+where
+    Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    R: FnOnce(tokio::time::Instant) -> RFut,
+    RFut: Future<Output = ()>,
+{
+    let status = match tokio::time::timeout(attempt_timeout, attempt).await {
+        Ok(Ok(response)) => return Ok(response.into_inner()),
+        Ok(Err(status)) if !is_transport_failure(&status) => return Err(status),
+        Ok(Err(status)) => status,
+        Err(_) => tonic::Status::deadline_exceeded(format!("{what} timed out")),
+    };
+    // The reconnect is bounded too: a hanging connect must not stall the
+    // caller (and with it the recovery attempt) indefinitely.
+    let deadline = tokio::time::Instant::now() + attempt_timeout;
+    let _ = tokio::time::timeout_at(deadline, reconnect(deadline)).await;
+    Err(status)
+}
+
+/// Retry an idempotent call within `budget`: each attempt and each
+/// reconnect is bounded by the remaining budget.
+async fn run_idempotent<T, A, Fut, R, RFut>(
+    what: &str,
+    budget: Duration,
+    attempt_timeout: Duration,
+    attempt: A,
+    reconnect: R,
+) -> std::result::Result<T, tonic::Status>
+where
+    A: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    R: Fn(tokio::time::Instant) -> RFut,
+    RFut: Future<Output = ()>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let attempt_deadline = (tokio::time::Instant::now() + attempt_timeout).min(deadline);
+        let status = match tokio::time::timeout_at(attempt_deadline, attempt()).await {
+            Ok(Ok(response)) => return Ok(response.into_inner()),
+            Ok(Err(status)) if !is_transport_failure(&status) => return Err(status),
+            Ok(Err(status)) => status,
+            Err(_) => tonic::Status::deadline_exceeded(format!("{what} timed out")),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(status);
+        }
+        debug!(what, error = %status, "Supervisor pool RPC failed; reconnecting");
+        // A hanging connect must not outlive the budget either.
+        let _ = tokio::time::timeout_at(deadline, reconnect(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(status);
+        }
+    }
+}
+
+fn is_transport_failure(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled
+    )
+}
+
 /// Ownership authority for one hosted session, backed by pool RPCs.
 #[derive(Debug)]
 struct PoolOwnershipAuthority {
-    client: PoolMemberClient,
+    client: PoolChannel,
     sandbox_id: String,
     ownership_epoch: u64,
     fenced: watch::Sender<bool>,
@@ -81,20 +242,23 @@ impl SupervisorOwnershipAuthority for PoolOwnershipAuthority {
         &self,
         request: RecoveryGrantRequest,
     ) -> std::result::Result<IssuedRecoveryGrant, BackendError> {
+        let grant_request = RequestSupervisorRecoveryGrantRequest {
+            sandbox_id: self.sandbox_id.clone(),
+            ownership_epoch: self.ownership_epoch,
+            supervisor_instance: request.supervisor_instance,
+            candidate_key_pem: request.candidate_key_pem,
+            challenge: request.challenge,
+            runtime_ownership_epoch: request.runtime_ownership_epoch,
+        };
         let response = self
             .client
-            .clone()
-            .request_supervisor_recovery_grant(RequestSupervisorRecoveryGrantRequest {
-                sandbox_id: self.sandbox_id.clone(),
-                ownership_epoch: self.ownership_epoch,
-                supervisor_instance: request.supervisor_instance,
-                candidate_key_pem: request.candidate_key_pem,
-                challenge: request.challenge,
-                runtime_ownership_epoch: request.runtime_ownership_epoch,
+            .call_once("request recovery grant", |mut client| async move {
+                client
+                    .request_supervisor_recovery_grant(grant_request)
+                    .await
             })
             .await
-            .map_err(|status| rpc_error("request recovery grant", &status))?
-            .into_inner();
+            .map_err(|status| rpc_error("request recovery grant", &status))?;
         Ok(IssuedRecoveryGrant {
             grant: response.grant,
             grant_id: response.grant_id,
@@ -106,33 +270,36 @@ impl SupervisorOwnershipAuthority for PoolOwnershipAuthority {
         supervisor_instance: &str,
         signed_receipt: &str,
     ) -> std::result::Result<String, BackendError> {
+        let activate = ActivateSupervisorAssignmentRequest {
+            sandbox_id: self.sandbox_id.clone(),
+            ownership_epoch: self.ownership_epoch,
+            supervisor_instance: supervisor_instance.to_string(),
+            signed_receipt: signed_receipt.to_string(),
+        };
         Ok(self
             .client
-            .clone()
-            .activate_supervisor_assignment(ActivateSupervisorAssignmentRequest {
-                sandbox_id: self.sandbox_id.clone(),
-                ownership_epoch: self.ownership_epoch,
-                supervisor_instance: supervisor_instance.to_string(),
-                signed_receipt: signed_receipt.to_string(),
+            .call_once("activate recovery", |mut client| async move {
+                client.activate_supervisor_assignment(activate).await
             })
             .await
             .map_err(|status| rpc_error("activate recovery", &status))?
-            .into_inner()
             .activation)
     }
 
     async fn lease(&self, supervisor_instance: &str) -> std::result::Result<String, BackendError> {
+        let renew = RenewSupervisorLeaseRequest {
+            sandbox_id: self.sandbox_id.clone(),
+            ownership_epoch: self.ownership_epoch,
+            supervisor_instance: supervisor_instance.to_string(),
+        };
         Ok(self
             .client
-            .clone()
-            .renew_supervisor_lease(RenewSupervisorLeaseRequest {
-                sandbox_id: self.sandbox_id.clone(),
-                ownership_epoch: self.ownership_epoch,
-                supervisor_instance: supervisor_instance.to_string(),
+            .call("renew lease", |mut client| {
+                let renew = renew.clone();
+                async move { client.renew_supervisor_lease(renew).await }
             })
             .await
             .map_err(|status| rpc_error("renew lease", &status))?
-            .into_inner()
             .lease)
     }
 
@@ -189,8 +356,8 @@ pub async fn run_pool(config: PoolConfig) -> Result<()> {
         .into_diagnostic()
         .wrap_err("create supervisor session root")?;
     // The gateway may still be starting; keep retrying instead of exiting.
-    let mut client = loop {
-        match connect_supervisor_pool(&config.endpoint, &config.token_file).await {
+    let client = loop {
+        match PoolChannel::connect(&config.endpoint, &config.token_file).await {
             Ok(client) => break client,
             Err(error) => {
                 warn!(error = %error, "Supervisor pool cannot reach the gateway yet; retrying");
@@ -219,21 +386,19 @@ pub async fn run_pool(config: PoolConfig) -> Result<()> {
                 true
             }
         });
+        let sync = SyncSupervisorPoolRequest {
+            active_sandbox_ids: sessions.keys().cloned().collect(),
+        };
         let response = match client
-            .sync_supervisor_pool(SyncSupervisorPoolRequest {
-                active_sandbox_ids: sessions.keys().cloned().collect(),
+            .call("sync supervisor pool", |mut client| {
+                let sync = sync.clone();
+                async move { client.sync_supervisor_pool(sync).await }
             })
             .await
         {
-            Ok(response) => response.into_inner(),
+            Ok(response) => response,
             Err(status) => {
                 warn!(error = %status, "Supervisor pool sync failed; retrying");
-                if status.code() == tonic::Code::Unavailable
-                    && let Ok(reconnected) =
-                        connect_supervisor_pool(&config.endpoint, &config.token_file).await
-                {
-                    client = reconnected;
-                }
                 continue;
             }
         };
@@ -308,6 +473,17 @@ pub async fn run_pool(config: PoolConfig) -> Result<()> {
                         let _ = session.terminate.send(true);
                     }
                 }
+                SupervisorAssignmentAction::Relinquish => {
+                    if let Some(session) = sessions.get(&assignment.sandbox_id)
+                        && !*session.abandon.borrow()
+                    {
+                        info!(
+                            "Planned handoff; releasing ownership without stopping the workload sandbox_id={}",
+                            assignment.sandbox_id
+                        );
+                        let _ = session.abandon.send(true);
+                    }
+                }
                 SupervisorAssignmentAction::Supervise | SupervisorAssignmentAction::Unspecified => {
                 }
             }
@@ -358,7 +534,7 @@ async fn shutdown_signal() {
 #[allow(clippy::too_many_arguments)]
 fn spawn_session(
     config: &PoolConfig,
-    client: PoolMemberClient,
+    client: PoolChannel,
     sandbox_id: String,
     sandbox_name: String,
     runtime_generation: String,
@@ -402,7 +578,7 @@ fn spawn_session(
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn run_session_thread(
     config: PoolConfig,
-    client: PoolMemberClient,
+    client: PoolChannel,
     sandbox_id: String,
     sandbox_name: String,
     ownership_epoch: u64,
@@ -527,7 +703,7 @@ fn host_on_session_runtime<F, Fut>(
 #[allow(clippy::too_many_arguments)]
 async fn run_hosted(
     config: &PoolConfig,
-    client: PoolMemberClient,
+    client: PoolChannel,
     sandbox_id: &str,
     sandbox_name: &str,
     ownership_epoch: u64,
@@ -537,15 +713,17 @@ async fn run_hosted(
     fence: watch::Sender<bool>,
     log_rx: tokio::sync::mpsc::Receiver<openshell_core::proto::SandboxLogLine>,
 ) -> Result<i32> {
+    let get = GetSupervisorAssignmentRequest {
+        sandbox_id: sandbox_id.to_string(),
+        ownership_epoch,
+    };
     let material = client
-        .clone()
-        .get_supervisor_assignment(GetSupervisorAssignmentRequest {
-            sandbox_id: sandbox_id.to_string(),
-            ownership_epoch,
+        .call("get supervisor assignment", |mut client| {
+            let get = get.clone();
+            async move { client.get_supervisor_assignment(get).await }
         })
         .await
-        .map_err(|status| miette::miette!("get supervisor assignment: {}", status.message()))?
-        .into_inner();
+        .map_err(|status| miette::miette!("get supervisor assignment: {}", status.message()))?;
     let auth_bundle: openshell_core::jwt::SupervisorAuthBundle =
         serde_json::from_slice(&material.auth_bundle_json)
             .into_diagnostic()
@@ -778,5 +956,114 @@ mod tests {
             !beta.misattributed.load(Ordering::SeqCst),
             "beta work observed another session's identity or OCSF context"
         );
+    }
+
+    mod pool_rpc {
+        use super::super::{run_idempotent, run_once};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const ATTEMPT: Duration = Duration::from_millis(1_500);
+        const BUDGET: Duration = Duration::from_secs(4);
+
+        #[allow(clippy::unnecessary_wraps)]
+        fn ok() -> Result<tonic::Response<u32>, tonic::Status> {
+            Ok(tonic::Response::new(7))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn idempotent_calls_retry_past_a_hung_gateway_on_a_new_connection() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let reconnects = Arc::new(AtomicUsize::new(0));
+            let result = run_idempotent(
+                "renew lease",
+                BUDGET,
+                ATTEMPT,
+                || {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n == 0 {
+                            // The first gateway hangs (paused, not dead).
+                            std::future::pending::<()>().await;
+                        }
+                        ok()
+                    }
+                },
+                |_| {
+                    reconnects.fetch_add(1, Ordering::SeqCst);
+                    async {}
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap(), 7);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn application_errors_are_not_retried() {
+            let attempts = AtomicUsize::new(0);
+            let result: Result<u32, _> = run_idempotent(
+                "renew lease",
+                BUDGET,
+                ATTEMPT,
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async { Err(tonic::Status::permission_denied("not the owner")) }
+                },
+                |_| async {},
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_hanging_reconnect_cannot_outlive_the_budget() {
+            let started = tokio::time::Instant::now();
+            let result: Result<u32, _> = run_idempotent(
+                "renew lease",
+                BUDGET,
+                ATTEMPT,
+                || async { Err(tonic::Status::unavailable("connection reset")) },
+                |_| std::future::pending::<()>(),
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+            assert!(
+                started.elapsed() <= BUDGET,
+                "elapsed {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn grant_and_activation_are_attempted_once() {
+            // A lost response (hang) is NOT retried: the next attempt could
+            // see "grant already issued" for a grant that was committed.
+            let reconnects = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let result: Result<u32, _> = run_once(
+                "request recovery grant",
+                ATTEMPT,
+                async {
+                    std::future::pending::<()>().await;
+                    ok()
+                },
+                |_| {
+                    reconnects.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>()
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+            assert_eq!(
+                reconnects.load(Ordering::SeqCst),
+                1,
+                "connection replaced for later calls"
+            );
+            assert!(started.elapsed() <= ATTEMPT * 2);
+        }
     }
 }

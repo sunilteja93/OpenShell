@@ -39,6 +39,9 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }
 tonic-prost-build = { workspace = true }

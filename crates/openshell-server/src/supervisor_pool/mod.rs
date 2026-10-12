@@ -11,14 +11,24 @@
 //!   the compute driver's [`SupervisorPoolBackend`].
 //! - [`assignment`] records which replica owns each sandbox runtime
 //!   generation and at which ownership epoch, durably and with CAS.
-//! - A level-triggered reconciler, safe to run on every gateway replica,
-//!   launches new generations, reserves fenced recovery after an owner's
-//!   enforced lease lapses, fails recoveries that miss their deadline, and
-//!   lets stop/delete win.
+//! - One gateway process at a time is the elected assignment coordinator
+//!   ([`coordinator`]): it alone places sandboxes, reserves fenced recovery
+//!   after an owner's enforced lease lapses, fails recoveries that miss their
+//!   deadline, drives drain/rebalance handoffs, and lets stop/delete win.
+//!   Every coordinator write is fenced by its lease term in the same database
+//!   transaction. Its progress is recorded as durable [`operations`].
+//! - Pool sync, assignment material, grants, activations, and owner lease
+//!   renewals are served by EVERY gateway with per-assignment CAS, so a
+//!   coordinator change never interrupts healthy supervision.
 //! - Recovery grants, activations, and leases are gateway-signed
 //!   `supervisor-recovery.v1` authority the sandbox runtime verifies itself.
 
 pub mod assignment;
+pub mod coordinator;
+pub mod operations;
+pub mod operator;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -42,19 +52,17 @@ use openshell_core::time::now_ms;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tonic::Status;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::auth::sandbox_jwt::SandboxSessionJwtAuthority;
 use crate::persistence::{PersistenceError, Store, WriteCondition};
 pub use assignment::{Assignment, AssignmentState, AssignmentStore, AssignmentTiming};
-use openshell_core::{ObjectId as _, ObjectName as _};
 
 /// Internal prototype default: two shared supervisor replicas per installation.
 pub const DEFAULT_POOL_REPLICAS: i32 = 2;
 const MEMBER_OBJECT_TYPE: &str = "supervisor_pool_member";
 const MEMBER_TTL_MS: i64 = 6_000;
 const SYNC_INTERVAL_MS: u32 = 1_000;
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const MEMBER_AUTH_CACHE_TTL: Duration = Duration::from_mins(1);
 const GRANT_TTL: Duration = Duration::from_secs(30);
 
@@ -135,12 +143,27 @@ struct MemberRecord {
     member_id: String,
     member_uid: String,
     last_seen_ms: i64,
+    /// Sandboxes whose sessions the member reported running at
+    /// `last_seen_ms`. A planned handoff's release is confirmed when a report
+    /// newer than the handoff no longer lists the sandbox.
+    #[serde(default)]
+    hosted: Vec<String>,
+}
+
+/// A pool member as last reported through sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberView {
+    pub member_id: String,
+    pub last_seen_ms: i64,
+    pub hosted: std::collections::BTreeSet<String>,
+    pub live: bool,
 }
 
 /// Gateway-side coordinator for the shared supervisor pool.
 pub struct SupervisorPool {
     store: Arc<Store>,
     assignments: AssignmentStore,
+    operations: operations::OperationStore,
     backend: Arc<dyn SupervisorPoolBackend>,
     authority: Arc<SandboxSessionJwtAuthority>,
     compute: crate::compute::ComputeRuntime,
@@ -169,7 +192,9 @@ fn assignment_status(error: assignment::AssignmentError) -> Status {
         | AssignmentError::DeadlinePassed => Status::permission_denied(error.to_string()),
         AssignmentError::WrongState
         | AssignmentError::LeaseValid
-        | AssignmentError::GrantAlreadyIssued => Status::failed_precondition(error.to_string()),
+        | AssignmentError::GrantAlreadyIssued
+        | AssignmentError::HandoffInProgress
+        | AssignmentError::NoHandoff => Status::failed_precondition(error.to_string()),
     }
 }
 
@@ -178,6 +203,7 @@ fn store_status(error: PersistenceError) -> Status {
         PersistenceError::Conflict { .. } => {
             Status::aborted("supervisor assignment changed concurrently; retry")
         }
+        PersistenceError::Fenced => Status::aborted("supervisor pool coordinator changed; retry"),
         other => Status::unavailable(format!("supervisor assignment store: {other}")),
     }
 }
@@ -231,6 +257,7 @@ impl SupervisorPool {
         timing.validate()?;
         Ok(Self {
             assignments: AssignmentStore::new(store.clone()),
+            operations: operations::OperationStore::new(store.clone()),
             store,
             backend,
             authority,
@@ -294,11 +321,19 @@ impl SupervisorPool {
         Ok(member)
     }
 
-    async fn heartbeat(&self, member: &PoolMember) -> Result<(), PersistenceError> {
+    async fn heartbeat(
+        &self,
+        member: &PoolMember,
+        hosted: &[String],
+    ) -> Result<(), PersistenceError> {
+        let mut hosted = hosted.to_vec();
+        hosted.sort();
+        hosted.dedup();
         let record = MemberRecord {
             member_id: member.member_id.clone(),
             member_uid: member.member_uid.clone(),
             last_seen_ms: now_ms(),
+            hosted,
         };
         let payload = serde_json::to_vec(&record)
             .map_err(|error| PersistenceError::Encode(error.to_string()))?;
@@ -316,23 +351,31 @@ impl SupervisorPool {
             .map(|_| ())
     }
 
-    async fn live_members(&self, now: i64) -> Result<Vec<String>, PersistenceError> {
+    /// Every known member with its latest report. Long-dead records are
+    /// garbage collected.
+    pub(crate) async fn members(&self, now: i64) -> Result<Vec<MemberView>, PersistenceError> {
         let records = self.store.list_by_type(MEMBER_OBJECT_TYPE, 1000, 0).await?;
         let mut members = Vec::new();
         for record in records {
             let Ok(member) = serde_json::from_slice::<MemberRecord>(&record.payload) else {
                 continue;
             };
-            if now.saturating_sub(member.last_seen_ms) < MEMBER_TTL_MS {
-                members.push(member.member_id);
-            } else if now.saturating_sub(member.last_seen_ms) > MEMBER_TTL_MS * 100 {
+            let age = now.saturating_sub(member.last_seen_ms);
+            if age > MEMBER_TTL_MS * 100 {
                 let _ = self
                     .store
                     .delete_if(MEMBER_OBJECT_TYPE, &record.id, record.resource_version)
                     .await;
+                continue;
             }
+            members.push(MemberView {
+                member_id: member.member_id,
+                last_seen_ms: member.last_seen_ms,
+                hosted: member.hosted.into_iter().collect(),
+                live: age < MEMBER_TTL_MS,
+            });
         }
-        members.sort();
+        members.sort_by(|a, b| a.member_id.cmp(&b.member_id));
         Ok(members)
     }
 
@@ -383,7 +426,9 @@ impl SupervisorPool {
         member: &PoolMember,
         request: SyncSupervisorPoolRequest,
     ) -> Result<SyncSupervisorPoolResponse, Status> {
-        self.heartbeat(member).await.map_err(store_status)?;
+        self.heartbeat(member, &request.active_sandbox_ids)
+            .await
+            .map_err(store_status)?;
         let assignments = self.assignments.list().await.map_err(store_status)?;
         let reported: std::collections::HashSet<&str> = request
             .active_sandbox_ids
@@ -396,6 +441,11 @@ impl SupervisorPool {
                 let owned = assignment.owner_member.as_deref() == Some(member.member_id.as_str());
                 let action = match assignment.state {
                     AssignmentState::Launching if owned => SupervisorAssignmentAction::Launch,
+                    // A planned handoff asks the owner to release ownership
+                    // without stopping the workload.
+                    AssignmentState::Active if owned && assignment.handoff.is_some() => {
+                        SupervisorAssignmentAction::Relinquish
+                    }
                     AssignmentState::Active if owned => SupervisorAssignmentAction::Supervise,
                     AssignmentState::Recovering if owned => SupervisorAssignmentAction::Recover,
                     AssignmentState::Terminated | AssignmentState::Failed
@@ -665,207 +715,9 @@ impl SupervisorPool {
             lease_ttl: Some(prost_duration_ms(self.timing.lease_ttl_ms)),
         })
     }
-
-    /// Revoke the previous owner's gateway credential lineage.
-    async fn rotate_gateway_token(&self, sandbox_id: &str) -> Result<(), Status> {
-        let Some(sandbox) = self.sandbox(sandbox_id).await? else {
-            return Ok(());
-        };
-        let metadata = sandbox
-            .metadata
-            .as_ref()
-            .ok_or_else(|| Status::internal("sandbox identity metadata is missing"))?;
-        let mut identity =
-            crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
-                .map_err(|_| Status::internal("sandbox runtime identity is invalid"))?;
-        identity.gateway_token_id = uuid::Uuid::new_v4();
-        identity.refresh_replay = None;
-        self.store
-            .update_message_cas::<Sandbox, _>(sandbox_id, metadata.resource_version, |sandbox| {
-                if let Some(metadata) = sandbox.metadata.as_mut() {
-                    identity.write(&mut metadata.annotations);
-                }
-            })
-            .await
-            .map(|_| ())
-            .map_err(|error| Status::aborted(format!("rotate gateway token: {error}")))
-    }
-
-    /// One level-triggered reconciliation pass. Safe on every gateway replica:
-    /// all decisions are CAS-guarded.
-    pub async fn reconcile_once(&self) -> Result<(), Status> {
-        let now = now_ms();
-        let members = self.live_members(now).await.map_err(store_status)?;
-        let sandboxes: Vec<Sandbox> = self
-            .store
-            .list_all_messages::<Sandbox>(10_000, 0)
-            .await
-            .map_err(|error| Status::unavailable(format!("list sandboxes: {error}")))?;
-        let mut assignments: HashMap<String, Assignment> = self
-            .assignments
-            .list()
-            .await
-            .map_err(store_status)?
-            .into_iter()
-            .map(|assignment| (assignment.sandbox_id.clone(), assignment))
-            .collect();
-
-        // Desired state from sandbox records.
-        let mut desired = std::collections::HashSet::new();
-        for sandbox in &sandboxes {
-            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-            let Some(generation) = sandbox_generation(sandbox) else {
-                continue;
-            };
-            if !wants_supervision(phase) || !has_runtime_binding(sandbox) {
-                continue;
-            }
-            let sandbox_id = sandbox.object_id().to_string();
-            let credential_epoch = sandbox_credential_epoch(sandbox);
-            desired.insert(sandbox_id.clone());
-            let existing = assignments.get(&sandbox_id);
-            if existing.is_some_and(|assignment| {
-                assignment.runtime_generation == generation
-                    && assignment.credential_epoch == credential_epoch
-            }) {
-                continue;
-            }
-            let mut pending = Assignment::pending(&sandbox_id, sandbox.object_name(), &generation);
-            pending.credential_epoch = credential_epoch;
-            match self.assignments.write(existing, &pending).await {
-                Ok(written) => {
-                    info!(%sandbox_id, generation, "Created supervisor assignment");
-                    assignments.insert(sandbox_id, written);
-                }
-                Err(error) => debug!(%sandbox_id, %error, "Assignment create raced"),
-            }
-        }
-
-        let mut load: HashMap<String, usize> = members.iter().map(|m| (m.clone(), 0)).collect();
-        for assignment in assignments.values() {
-            if let Some(owner) = assignment.owner_member.as_ref()
-                && matches!(
-                    assignment.state,
-                    AssignmentState::Launching
-                        | AssignmentState::Active
-                        | AssignmentState::Recovering
-                )
-                && let Some(count) = load.get_mut(owner)
-            {
-                *count += 1;
-            }
-        }
-        let pick = |load: &HashMap<String, usize>, exclude: Option<&str>| {
-            load.iter()
-                .filter(|(member, _)| Some(member.as_str()) != exclude)
-                .min_by(|(a_member, a), (b_member, b)| a.cmp(b).then(a_member.cmp(b_member)))
-                .map(|(member, _)| member.clone())
-        };
-
-        for (sandbox_id, assignment) in assignments {
-            let result = if !desired.contains(&sandbox_id) {
-                match assignment.state {
-                    AssignmentState::Terminated | AssignmentState::Failed => {
-                        if !sandboxes
-                            .iter()
-                            .any(|sandbox| sandbox.object_id() == sandbox_id)
-                        {
-                            let _ = self.assignments.delete(&assignment).await;
-                        }
-                        continue;
-                    }
-                    _ => {
-                        info!(%sandbox_id, "Sandbox no longer wants supervision; terminating assignment");
-                        self.assignments
-                            .write(Some(&assignment), &assignment.terminate())
-                            .await
-                            .map(|_| ())
-                    }
-                }
-            } else if let Some(failed) = assignment.fail_if_overdue(now) {
-                warn!(
-                    %sandbox_id,
-                    reason = failed.failure_reason.as_deref().unwrap_or_default(),
-                    "Supervisor recovery failed"
-                );
-                let written = self.assignments.write(Some(&assignment), &failed).await;
-                if written.is_ok() {
-                    self.compute
-                        .mark_supervisor_recovery_failed(
-                            &sandbox_id,
-                            failed.failure_reason.as_deref().unwrap_or_default(),
-                        )
-                        .await;
-                }
-                written.map(|_| ())
-            } else if assignment.state == AssignmentState::Pending {
-                let Some(member) = pick(&load, None) else {
-                    continue;
-                };
-                let next = assignment
-                    .assign_launch(&member, now, &self.timing)
-                    .map_err(assignment_status)?;
-                let written = self.assignments.write(Some(&assignment), &next).await;
-                if written.is_ok() {
-                    *load.entry(member.clone()).or_default() += 1;
-                    info!(%sandbox_id, %member, "Assigned sandbox to shared supervisor");
-                }
-                written.map(|_| ())
-            } else if assignment.needs_recovery(now) {
-                let Some(candidate) = pick(&load, assignment.owner_member.as_deref()) else {
-                    warn!(%sandbox_id, "No eligible supervisor replica for recovery");
-                    continue;
-                };
-                let Ok(next) = assignment.reserve_recovery(&candidate, now, &self.timing) else {
-                    continue;
-                };
-                match self.assignments.write(Some(&assignment), &next).await {
-                    Ok(written) => {
-                        *load.entry(candidate.clone()).or_default() += 1;
-                        warn!(
-                            %sandbox_id,
-                            previous_owner = assignment.owner_member.as_deref().unwrap_or_default(),
-                            %candidate,
-                            ownership_epoch = written.ownership_epoch,
-                            "Reserved fenced supervisor recovery"
-                        );
-                        if let Err(error) = self.rotate_gateway_token(&sandbox_id).await {
-                            warn!(%sandbox_id, %error, "Gateway token rotation for recovery failed");
-                        }
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
-            } else {
-                continue;
-            };
-            if let Err(error) = result {
-                debug!(%sandbox_id, %error, "Supervisor assignment reconcile step raced");
-            }
-        }
-        Ok(())
-    }
-
-    /// Run the reconciler until gateway shutdown.
-    pub fn spawn_reconciler(self: &Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let pool = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = shutdown.changed() => return,
-                }
-                if let Err(error) = pool.reconcile_once().await {
-                    warn!(%error, "Supervisor pool reconcile failed");
-                }
-            }
-        });
-    }
 }
 
-fn prost_duration_ms(milliseconds: i64) -> prost_types::Duration {
+pub(crate) fn prost_duration_ms(milliseconds: i64) -> prost_types::Duration {
     prost_types::Duration {
         seconds: milliseconds / 1000,
         nanos: i32::try_from((milliseconds % 1000) * 1_000_000).unwrap_or(0),
@@ -951,7 +803,34 @@ mod tests {
         recovery_budget_ms: 2_000,
         attempt_budget_ms: 1_000,
         runtime_recovery_window_ms: 30_000,
+        release_budget_ms: 1_000,
     };
+
+    impl SupervisorPool {
+        /// Run one coordinator pass as a test coordinator ("test-gateway"),
+        /// acquiring the lease if it is free.
+        async fn reconcile_once(
+            &self,
+        ) -> Result<coordinator::PassReport, coordinator::CoordinateError> {
+            let now = now_ms();
+            let lease = self
+                .store
+                .acquire_coordinator_lease(
+                    coordinator::COORDINATOR_LEASE,
+                    "test-gateway/1",
+                    now,
+                    coordinator::COORDINATOR_TTL_MS,
+                )
+                .await?
+                .expect("test coordinator lease is free");
+            let fence = crate::persistence::coordinator::CoordinatorFence {
+                lease: coordinator::COORDINATOR_LEASE.to_string(),
+                holder: lease.holder,
+                term: lease.term,
+            };
+            self.coordinate_once(&fence, now).await
+        }
+    }
 
     async fn set_phase(store: &Store, phase: SandboxPhase) {
         let mut sandbox = store
@@ -1373,7 +1252,9 @@ mod tests {
         let reserved = active
             .reserve_recovery("replica-b", now - 9_000, &FAST)
             .unwrap();
-        let failed = reserved.fail_if_overdue(now).expect("deadline passed");
+        let failed = reserved
+            .fail_if_overdue(now, &FAST)
+            .expect("deadline passed");
         assert_eq!(failed.state, AssignmentState::Failed);
         assert!(failed.failure_reason.unwrap().contains("deadline"));
     }

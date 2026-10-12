@@ -63,6 +63,43 @@ A crash or lost database-lock session can leave a parked marker. Reconfigure or
 reauthorize the refresh grant after investigating its issuer state. Changing a
 marker directly is not a supported recovery workflow.
 
+## Supervisor pool coordinator (prototype)
+
+With `supervisor_topology = "gateway"`, `supervisor_pool::coordinator` elects
+one gateway process as the assignment coordinator through a lease row in
+`coordinator_leases` (migration 009). The holder is `<replica>/<uuid>`, unique
+per process; the lease lasts 5 seconds and is renewed every second. The row is
+never deleted, so terms only increase, and shutdown releases it in place.
+Followers run no reconciliation; every gateway keeps serving pool sync,
+assignment material, grants, activations, and owner lease renewals with
+per-assignment CAS.
+
+Every coordinator decision is one `Store::write_fenced` transaction: the
+assignment CAS, the durable operation record, and, for a reservation, the
+gateway-token rotation that revokes the previous owner. The transaction locks
+the lease row (`FOR SHARE` on PostgreSQL, `BEGIN IMMEDIATE` on SQLite), then
+samples the database clock and requires the same holder, the same term, and an
+unexpired lease, judged at `max(caller clock, database clock)`. A paused
+coordinator that resumes after its lease expired or after a takeover therefore
+writes nothing. Gateway and database clocks are assumed to be synchronized well
+within the lease TTL.
+
+`supervisor_pool::operations` records assign, recover, drain, and rebalance
+operations with a phase and a message. Assign and recover IDs are
+deterministic, so a new coordinator adopts them; a recovery's deadline comes
+from the assignment and is never extended. Drain and rebalance requests are
+recorded by any gateway through the operator RPCs in `supervisor_pool::operator`
+(bearer, `platform_admin`), but they are inert until the coordinator admits
+them, one at a time. A drain that would leave no eligible replica is refused at
+admission. An admitted drain cordons its member from placement, recovery, and
+handoff targets until it is cancelled. Planned moves record a release stage on
+the assignment: the owner receives `RELINQUISH`, and once its sync no longer
+reports the sandbox (or it is gone, or 10 seconds passed) the coordinator
+reserves the next epoch for the target and the normal fenced recovery protocol
+completes the move. Rebalance moves from the most- to the least-loaded eligible
+member while their loads differ by more than one, counting in-flight
+reservations, and moves each sandbox at most once per operation.
+
 ## Focused verification
 
 ```shell

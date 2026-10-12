@@ -289,9 +289,12 @@ Use `mise run e2e:kubernetes:supervisor-topology` for the gateway supervisor
 topology prototype (`[openshell.gateway] supervisor_topology = "gateway"`). It
 uses `ci/values-supervisor-gateway-topology.yaml` (two gateway replicas, the
 external PostgreSQL fixture, Envoy) and runs CLI conformance plus
-`kubernetes_supervisor_topology`, which kills and pauses shared supervisor Pods
-to check fenced takeover of running agents. The partition step pauses one
-supervisor process through `crictl` inside the k3d or kind node container
+`kubernetes_supervisor_topology`. That test pauses the elected coordinator
+gateway (another gateway must take over while agents keep running), drains and
+rebalances the shared pool through the operator API over a `kubectl
+port-forward`, then kills and pauses shared supervisor Pods to check fenced
+takeover of running agents. The pause steps signal one gateway or supervisor
+process through `crictl` inside the k3d or kind node container
 (`OPENSHELL_E2E_KUBE_NODE_CONTAINER` overrides the derived name); run it only
 against a disposable cluster.
 

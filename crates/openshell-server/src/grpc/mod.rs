@@ -829,6 +829,40 @@ impl OpenShell for OpenShellService {
             .map(Response::new)
     }
 
+    async fn get_supervisor_pool_status(
+        &self,
+        _request: Request<openshell_core::proto::GetSupervisorPoolStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSupervisorPoolStatusResponse>, Status> {
+        let pool = self.supervisor_pool()?;
+        pool.status(&self.state.replica_id).await.map(Response::new)
+    }
+
+    async fn start_supervisor_pool_operation(
+        &self,
+        request: Request<openshell_core::proto::StartSupervisorPoolOperationRequest>,
+    ) -> Result<Response<openshell_core::proto::StartSupervisorPoolOperationResponse>, Status> {
+        let pool = self.supervisor_pool()?;
+        let requested_by = request
+            .extensions()
+            .get::<crate::auth::principal::Principal>()
+            .and_then(crate::auth::principal::Principal::user_identity)
+            .map(|identity| identity.subject.clone());
+        pool.start_operation(request.into_inner(), requested_by)
+            .await
+            .map(Response::new)
+    }
+
+    async fn cancel_supervisor_pool_operation(
+        &self,
+        request: Request<openshell_core::proto::CancelSupervisorPoolOperationRequest>,
+    ) -> Result<Response<openshell_core::proto::CancelSupervisorPoolOperationResponse>, Status>
+    {
+        let pool = self.supervisor_pool()?;
+        pool.cancel_operation(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
     async fn issue_sandbox_token(
         &self,
         request: Request<IssueSandboxTokenRequest>,

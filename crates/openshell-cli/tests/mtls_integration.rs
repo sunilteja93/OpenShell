@@ -68,6 +68,28 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn get_supervisor_pool_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSupervisorPoolStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSupervisorPoolStatusResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn start_supervisor_pool_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StartSupervisorPoolOperationRequest>,
+    ) -> Result<Response<openshell_core::proto::StartSupervisorPoolOperationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn cancel_supervisor_pool_operation(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CancelSupervisorPoolOperationRequest>,
+    ) -> Result<Response<openshell_core::proto::CancelSupervisorPoolOperationResponse>, Status>
+    {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,

@@ -747,8 +747,15 @@ pub(crate) async fn run_server(
         )
         .map_err(Error::config)?;
         let pool = Arc::new(pool);
-        pool.spawn_reconciler(shutdown_rx.clone());
-        info!("Gateway supervisor topology enabled: shared supervisor pool coordinator running");
+        // Every gateway process competes for the single coordinator lease
+        // with a unique per-process identity; all of them keep serving pool
+        // RPCs and owner lease renewals.
+        let holder = supervisor_pool::coordinator::process_holder_id(&state.replica_id);
+        pool.spawn_coordinator(holder.clone(), shutdown_rx.clone());
+        info!(
+            holder,
+            "Gateway supervisor topology enabled: competing for the assignment coordinator lease"
+        );
         state.supervisor_pool = Some(pool);
     }
 
