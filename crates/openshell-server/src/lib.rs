@@ -45,6 +45,7 @@ mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
+pub mod supervisor_pool;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -368,6 +369,9 @@ pub struct ServerState {
     /// Empty when OIDC is not configured — `authorize_workspace()` treats
     /// every authenticated user as Platform Admin in that case.
     pub admin_role: String,
+
+    /// Shared supervisor pool coordinator in gateway supervisor topology.
+    pub supervisor_pool: Option<Arc<supervisor_pool::SupervisorPool>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -465,6 +469,7 @@ impl ServerState {
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
             admin_role,
+            supervisor_pool: None,
         }
     }
 }
@@ -647,6 +652,7 @@ pub(crate) async fn run_server(
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
+    let supervisor_pool_slot = supervisor_pool::SupervisorPoolSlot::default();
     let compute = build_compute_runtime(
         &compute_drivers,
         &compute_driver,
@@ -658,6 +664,7 @@ pub(crate) async fn run_server(
         tracing_log_bus.clone(),
         supervisor_sessions.clone(),
         shutdown_rx.clone(),
+        supervisor_pool_slot.clone(),
     )
     .await?;
     let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
@@ -716,6 +723,33 @@ pub(crate) async fn run_server(
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
+    }
+
+    if config.supervisor_topology == openshell_core::config::SupervisorTopology::Gateway {
+        let backend = supervisor_pool_slot.take().ok_or_else(|| {
+            Error::config(
+                "supervisor_topology = \"gateway\" requires a compute driver that provides a \
+                 shared supervisor pool; only the in-process Kubernetes driver supports it",
+            )
+        })?;
+        let authority = state.sandbox_session_jwt_authority.clone().ok_or_else(|| {
+            Error::config(
+                "supervisor_topology = \"gateway\" requires [openshell.gateway.gateway_jwt] \
+                 so the gateway can sign supervisor ownership authority",
+            )
+        })?;
+        let pool = supervisor_pool::SupervisorPool::new(
+            store.clone(),
+            backend,
+            authority,
+            state.compute.clone(),
+            supervisor_pool::AssignmentTiming::DEFAULT,
+        )
+        .map_err(Error::config)?;
+        let pool = Arc::new(pool);
+        pool.spawn_reconciler(shutdown_rx.clone());
+        info!("Gateway supervisor topology enabled: shared supervisor pool coordinator running");
+        state.supervisor_pool = Some(pool);
     }
 
     if state.sandbox_session_jwt_authority.is_some()
@@ -1548,11 +1582,22 @@ impl ComputeDriverConfigContext<'_> {
     {
         compute::driver_config::driver_config_from_context(self.driver_startup, self.driver_name)
     }
+
+    /// Gateway-level supervisor placement (`[openshell.gateway]
+    /// supervisor_topology`).
+    #[must_use]
+    pub fn supervisor_topology(&self) -> openshell_core::config::SupervisorTopology {
+        self.driver_startup
+            .file
+            .and_then(|file| file.openshell.gateway.supervisor_topology)
+            .unwrap_or_default()
+    }
 }
 
 pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
+    supervisor_pool: supervisor_pool::SupervisorPoolSlot,
 }
 
 impl ComputeDriverBuildContext<'_> {
@@ -1613,6 +1658,15 @@ impl ComputeDriverBuildContext<'_> {
         self.shutdown_rx.clone()
     }
 
+    /// Register the shared supervisor pool implemented by this driver.
+    /// Required when the gateway uses `supervisor_topology = "gateway"`.
+    pub fn register_supervisor_pool(
+        &self,
+        backend: Arc<dyn supervisor_pool::SupervisorPoolBackend>,
+    ) {
+        self.supervisor_pool.register(backend);
+    }
+
     #[must_use]
     pub fn otlp_config(&self) -> Option<&config_file::OtlpConfig> {
         self.config
@@ -1634,6 +1688,7 @@ async fn build_compute_runtime(
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
+    supervisor_pool: supervisor_pool::SupervisorPoolSlot,
 ) -> Result<ComputeRuntime> {
     let driver = validate_compute_driver_config(
         registry,
@@ -1659,6 +1714,7 @@ async fn build_compute_runtime(
                     driver_startup,
                 },
                 shutdown_rx,
+                supervisor_pool,
             };
             let instance = registration.factory.build(build_context).await?;
             match instance {

@@ -266,16 +266,85 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = kubernetes_config(context.config_context())?;
         config.supervisor_otlp_endpoint = context.otlp_config().map(|otlp| otlp.endpoint.clone());
+        let shared_pool = config.shared_supervisor_pool();
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        if shared_pool {
+            driver
+                .ensure_supervisor_pool()
+                .await
+                .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+            context.register_supervisor_pool(std::sync::Arc::new(KubernetesSupervisorPool {
+                driver: driver.clone(),
+            }));
+        }
         let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
         ))
+    }
+}
+
+/// Gateway-topology shared supervisor pool backed by the in-process
+/// Kubernetes driver.
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
+#[derive(Debug)]
+struct KubernetesSupervisorPool {
+    driver: openshell_driver_kubernetes::KubernetesComputeDriver,
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
+#[tonic::async_trait]
+impl openshell_server::supervisor_pool::SupervisorPoolBackend for KubernetesSupervisorPool {
+    async fn authenticate_member(
+        &self,
+        credential: &str,
+    ) -> Result<openshell_server::supervisor_pool::PoolMember, tonic::Status> {
+        let (pod_name, pod_uid) = self
+            .driver
+            .authenticate_supervisor_pool_member(credential)
+            .await?;
+        Ok(openshell_server::supervisor_pool::PoolMember {
+            member_id: pod_name,
+            member_uid: pod_uid,
+        })
+    }
+
+    async fn supervisor_bootstrap(
+        &self,
+        sandbox_id: &str,
+        runtime_generation: &str,
+    ) -> Result<openshell_server::supervisor_pool::SupervisorBootstrap, tonic::Status> {
+        let mut data = self
+            .driver
+            .supervisor_pool_bootstrap(sandbox_id, runtime_generation)
+            .await?;
+        let text = |data: &mut std::collections::BTreeMap<String, Vec<u8>>, key: &str| {
+            data.remove(key)
+                .map(|value| String::from_utf8_lossy(&value).into_owned())
+                .unwrap_or_default()
+        };
+        let runtime_descriptor_json = data.remove("runtime-descriptor.json").ok_or_else(|| {
+            tonic::Status::failed_precondition("supervisor bootstrap has no runtime descriptor")
+        })?;
+        let auth_bundle_json = data.remove("auth.json").ok_or_else(|| {
+            tonic::Status::failed_precondition("supervisor bootstrap has no auth bundle")
+        })?;
+        Ok(openshell_server::supervisor_pool::SupervisorBootstrap {
+            runtime_descriptor_json,
+            auth_bundle_json,
+            main_process_spec_json: text(
+                &mut data,
+                openshell_driver_kubernetes::supervisor_pool::MAIN_PROCESS_SPEC_KEY,
+            ),
+            proxy_ca_cert_pem: text(&mut data, "proxy-ca.crt"),
+            proxy_ca_key_pem: text(&mut data, "proxy-ca.key"),
+            upstream_proxy_ca_pem: text(&mut data, "upstream-proxy-ca.pem"),
+        })
     }
 }
 
@@ -285,6 +354,7 @@ fn kubernetes_config(
 ) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
     let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
         context.driver_config()?;
+    config.supervisor_topology = context.supervisor_topology();
     config.sandbox_runtime_image = prefer_environment(
         config.sandbox_runtime_image,
         std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),

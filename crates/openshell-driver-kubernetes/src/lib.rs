@@ -9,6 +9,7 @@ mod lifecycle;
 pub mod otel_tracing;
 mod resource_admission;
 mod sandbox_runtime;
+pub mod supervisor_pool;
 
 pub use config::{
     DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,

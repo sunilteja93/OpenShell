@@ -223,6 +223,13 @@ impl OpenShellService {
     pub fn new(state: Arc<ServerState>) -> Self {
         Self { state }
     }
+
+    #[allow(clippy::result_large_err)]
+    fn supervisor_pool(&self) -> Result<&Arc<crate::supervisor_pool::SupervisorPool>, Status> {
+        self.state.supervisor_pool.as_ref().ok_or_else(|| {
+            Status::failed_precondition("this gateway does not use the shared supervisor topology")
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +772,62 @@ impl OpenShell for OpenShellService {
     }
 
     // --- Sandbox identity ---
+
+    async fn sync_supervisor_pool(
+        &self,
+        request: Request<openshell_core::proto::SyncSupervisorPoolRequest>,
+    ) -> Result<Response<openshell_core::proto::SyncSupervisorPoolResponse>, Status> {
+        let pool = self.supervisor_pool()?;
+        let member = pool.authenticate(request.metadata()).await?;
+        pool.sync(&member, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_supervisor_assignment(
+        &self,
+        request: Request<openshell_core::proto::GetSupervisorAssignmentRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSupervisorAssignmentResponse>, Status> {
+        let pool = self.supervisor_pool()?;
+        let member = pool.authenticate(request.metadata()).await?;
+        pool.get_assignment(&member, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn request_supervisor_recovery_grant(
+        &self,
+        request: Request<openshell_core::proto::RequestSupervisorRecoveryGrantRequest>,
+    ) -> Result<Response<openshell_core::proto::RequestSupervisorRecoveryGrantResponse>, Status>
+    {
+        let pool = self.supervisor_pool()?;
+        let member = pool.authenticate(request.metadata()).await?;
+        pool.request_grant(&member, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn activate_supervisor_assignment(
+        &self,
+        request: Request<openshell_core::proto::ActivateSupervisorAssignmentRequest>,
+    ) -> Result<Response<openshell_core::proto::ActivateSupervisorAssignmentResponse>, Status> {
+        let pool = self.supervisor_pool()?;
+        let member = pool.authenticate(request.metadata()).await?;
+        pool.activate(&member, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn renew_supervisor_lease(
+        &self,
+        request: Request<openshell_core::proto::RenewSupervisorLeaseRequest>,
+    ) -> Result<Response<openshell_core::proto::RenewSupervisorLeaseResponse>, Status> {
+        let pool = self.supervisor_pool()?;
+        let member = pool.authenticate(request.metadata()).await?;
+        pool.renew(&member, request.into_inner())
+            .await
+            .map(Response::new)
+    }
 
     async fn issue_sandbox_token(
         &self,

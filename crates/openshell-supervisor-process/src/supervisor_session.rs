@@ -390,7 +390,9 @@ async fn run_session_loop(config: SessionConfig) {
                     peer_endpoint = %peer_endpoint,
                     "supervisor session: following gateway redirect"
                 );
-                target = peer_endpoint;
+                // A hosted session keeps its own credentials on every gateway
+                // replica it is redirected to.
+                target = grpc_client::rescope_endpoint(&config.endpoint, &peer_endpoint);
                 redirected = true;
                 // No backoff: this is an expected handoff, not a failure.
             }

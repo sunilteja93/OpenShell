@@ -239,6 +239,22 @@ impl SandboxSessionJwtAuthority {
         })
     }
 
+    /// Mint gateway-signed supervisor ownership authority
+    /// (`supervisor-recovery.v1`) verified by the sandbox runtime.
+    #[allow(clippy::result_large_err)]
+    pub fn mint_supervisor_authority(
+        &self,
+        authority: &openshell_core::jwt::SupervisorAuthority,
+        ttl: Duration,
+    ) -> Result<openshell_core::jwt::MintedSupervisorAuthority, Status> {
+        self.issuer
+            .mint_supervisor_authority(authority, ttl)
+            .map_err(|error| {
+                warn!(%error, "failed to mint supervisor authority");
+                Status::internal("failed to mint supervisor authority")
+            })
+    }
+
     pub fn verify_gateway_token(&self, token: &str) -> Result<AuthenticatedSandboxSession, Status> {
         self.gateway_verifier
             .verify(token)

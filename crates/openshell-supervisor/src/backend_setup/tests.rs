@@ -99,6 +99,7 @@ impl TestSetup {
                 HashMap::from([("TEST_CONFIG".into(), "initial".into())]),
             ),
             sandbox_bearer: self.auth.sandbox_bearer_slot().unwrap(),
+            ownership: None,
         }
     }
 }
@@ -567,6 +568,7 @@ fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
             b"test-evidence",
         )
         .unwrap(),
+        supervisor_recovery: None,
     };
     for is_vm in [false, true] {
         if is_vm {
@@ -698,6 +700,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 auth_bundle: setup.auth.clone(),
                 admitted_isolation_backend: Some(TEST_BACKEND.into()),
                 main_exit_marker: Some(marker.clone()),
+                hosted: None,
             },
         ))
     };

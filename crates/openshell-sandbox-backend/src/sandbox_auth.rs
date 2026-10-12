@@ -121,6 +121,25 @@ impl SandboxProtocolAuthenticator {
             session,
         })
     }
+
+    /// Verify gateway-signed supervisor authority for this exact runtime.
+    pub fn verify_supervisor_authority(
+        &self,
+        token: &str,
+        kind: openshell_core::jwt::SupervisorAuthorityKind,
+    ) -> Result<openshell_core::jwt::VerifiedSupervisorAuthority, SandboxAuthError> {
+        let verified = self.verifier.verify_supervisor_authority(token)?;
+        if verified.authority.kind != kind {
+            return Err(SandboxAuthError::WrongAuthorityKind);
+        }
+        if verified.authority.sandbox_id != self.expected_sandbox_id {
+            return Err(SandboxAuthError::WrongSandbox);
+        }
+        if verified.authority.runtime_generation != self.expected_runtime_generation {
+            return Err(SandboxAuthError::WrongRuntimeGeneration);
+        }
+        Ok(verified)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +333,54 @@ impl SandboxConnectionRegistry {
         was_active
     }
 
+    /// Fence every existing connection and re-pin the runtime to a recovery
+    /// candidate. The caller must have verified gateway-signed recovery
+    /// authority for a strictly higher ownership epoch. Returns the
+    /// connections that must be closed; `keep` is the candidate's own
+    /// connection.
+    pub fn fence_for_recovery(
+        &self,
+        candidate: crate::boundary_protocol::SupervisorInstanceId,
+        keep: SandboxConnectionId,
+    ) -> Result<Vec<SandboxConnectionId>, SandboxAuthError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.terminal {
+            return Err(SandboxAuthError::TerminalSession);
+        }
+        let fenced = state
+            .active
+            .take()
+            .into_iter()
+            .chain(state.pending.take())
+            .map(|connection| connection.id)
+            .filter(|id| *id != keep)
+            .collect();
+        state.supervisor_instance_id = Some(candidate);
+        Ok(fenced)
+    }
+
+    /// The supervisor process currently allowed to attach.
+    #[must_use]
+    pub fn supervisor_instance(&self) -> Option<crate::boundary_protocol::SupervisorInstanceId> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .supervisor_instance_id
+    }
+
+    /// The confirmed active connection, when one exists.
+    #[must_use]
+    pub fn active_connection(&self) -> Option<SandboxConnectionId> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .map(|connection| connection.id)
+    }
+
     pub fn mark_terminal(&self) {
         let mut state = self
             .state
@@ -350,6 +417,8 @@ pub enum SandboxAuthError {
     ConnectionNotAttached,
     #[error("sandbox session is terminal")]
     TerminalSession,
+    #[error("supervisor authority token has the wrong purpose")]
+    WrongAuthorityKind,
 }
 
 #[cfg(test)]
@@ -545,6 +614,64 @@ mod tests {
             Err(SandboxAuthError::WrongSupervisorInstance)
         );
         assert_eq!(registry.attach(&replacement, first_instance), Ok(None));
+    }
+
+    #[test]
+    fn recovery_fence_repins_the_candidate_and_rejects_the_stale_owner() {
+        let (authenticator, token) = fixture(1);
+        let old_id = SandboxConnectionId::new();
+        let old = authenticator
+            .authenticate(old_id, &metadata(token.token.expose_secret()))
+            .expect("old principal");
+        let registry = registry_for(&old);
+        let old_instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        registry.attach(&old, old_instance).expect("attach old");
+        registry.confirm(&old).expect("confirm old");
+
+        // The old owner is still connected (partition): fencing closes it.
+        let candidate_id = SandboxConnectionId::new();
+        let candidate = authenticator
+            .authenticate(candidate_id, &metadata(token.token.expose_secret()))
+            .expect("candidate principal");
+        let candidate_instance = crate::boundary_protocol::SupervisorInstanceId::new();
+        let fenced = registry
+            .fence_for_recovery(candidate_instance, candidate_id)
+            .expect("fence");
+        assert_eq!(fenced, vec![old_id]);
+        assert_eq!(registry.active_connection(), None);
+        assert_eq!(registry.supervisor_instance(), Some(candidate_instance));
+        assert_eq!(
+            registry.require_active(&old),
+            Err(SandboxAuthError::ConnectionNotAttached)
+        );
+
+        // The returning stale owner cannot reattach, even with valid credentials.
+        let returning_id = SandboxConnectionId::new();
+        let returning = authenticator
+            .authenticate(returning_id, &metadata(token.token.expose_secret()))
+            .expect("returning principal");
+        assert_eq!(
+            registry.attach(&returning, old_instance),
+            Err(SandboxAuthError::WrongSupervisorInstance)
+        );
+        assert_eq!(registry.attach(&candidate, candidate_instance), Ok(None));
+        registry.confirm(&candidate).expect("confirm candidate");
+        assert_eq!(registry.active_connection(), Some(candidate_id));
+    }
+
+    #[test]
+    fn terminal_sessions_cannot_be_fenced_for_recovery() {
+        let (authenticator, token) = fixture(1);
+        let id = SandboxConnectionId::new();
+        let principal = authenticator
+            .authenticate(id, &metadata(token.token.expose_secret()))
+            .expect("principal");
+        let registry = registry_for(&principal);
+        registry.mark_terminal();
+        assert_eq!(
+            registry.fence_for_recovery(crate::boundary_protocol::SupervisorInstanceId::new(), id),
+            Err(SandboxAuthError::TerminalSession)
+        );
     }
 
     #[test]

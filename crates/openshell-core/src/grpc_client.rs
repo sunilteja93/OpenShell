@@ -86,6 +86,116 @@ static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
 #[cfg(feature = "jwt")]
 static SANDBOX_BEARER_SLOT: OnceLock<crate::jwt::SessionBearerTokenSlot> = OnceLock::new();
 
+/// Query parameter that scopes gateway credentials to one supervisor session
+/// hosted in a shared supervisor process.
+///
+/// A session-scoped endpoint has the same transport target as its base
+/// endpoint; the parameter never reaches the wire. Every gateway client built
+/// from that endpoint authenticates with that session's credentials instead
+/// of the process-wide slot, so sessions cannot use each other's identity.
+pub const SUPERVISOR_SESSION_ENDPOINT_PARAM: &str = "openshell-supervisor-session";
+
+/// Credentials owned by one hosted supervisor session.
+struct SessionCredentials {
+    slot: TokenSlot,
+    #[cfg(feature = "jwt")]
+    sandbox_bearer: crate::jwt::SessionBearerTokenSlot,
+    refresh: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl Drop for SessionCredentials {
+    fn drop(&mut self) {
+        let refresh = self
+            .refresh
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(refresh) = refresh {
+            refresh.abort();
+        }
+    }
+}
+
+static SESSION_CREDENTIALS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Arc<SessionCredentials>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Build the endpoint one hosted supervisor session uses for every gateway call.
+#[must_use]
+pub fn session_scoped_endpoint(base: &str, session_key: &str) -> String {
+    format!(
+        "{}/?{SUPERVISOR_SESSION_ENDPOINT_PARAM}={session_key}",
+        base.trim_end_matches('/')
+    )
+}
+
+/// Split a possibly session-scoped endpoint into its transport endpoint and
+/// session key.
+#[must_use]
+pub fn split_session_endpoint(endpoint: &str) -> (&str, Option<&str>) {
+    let marker = format!("/?{SUPERVISOR_SESSION_ENDPOINT_PARAM}=");
+    match endpoint.split_once(marker.as_str()) {
+        Some((base, key)) if !key.is_empty() => (base, Some(key)),
+        _ => (endpoint, None),
+    }
+}
+
+/// Apply `template`'s session scope (if any) to another gateway endpoint, for
+/// example a peer replica named by a session redirect.
+#[must_use]
+pub fn rescope_endpoint(template: &str, endpoint: &str) -> String {
+    let (base, _) = split_session_endpoint(endpoint);
+    match split_session_endpoint(template) {
+        (_, Some(key)) => session_scoped_endpoint(base, key),
+        (_, None) => base.to_string(),
+    }
+}
+
+fn session_credentials(key: &str) -> Option<Arc<SessionCredentials>> {
+    SESSION_CREDENTIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned()
+}
+
+/// Remove a hosted session's credentials and stop its renewal loop.
+pub fn remove_session_credentials(endpoint: &str) {
+    if let (_, Some(key)) = split_session_endpoint(endpoint) {
+        SESSION_CREDENTIALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+}
+
+/// Install launch credentials for the session that owns `endpoint`. A
+/// non-session endpoint installs the process-wide credentials.
+#[cfg(feature = "jwt")]
+pub fn install_supervisor_auth_bundle_for_endpoint(
+    endpoint: &str,
+    bundle: &crate::jwt::SupervisorAuthBundle,
+) -> Result<crate::jwt::SessionBearerTokenSlot> {
+    let (_, Some(key)) = split_session_endpoint(endpoint) else {
+        return install_supervisor_auth_bundle(bundle);
+    };
+    let bearer = validate_gateway_bearer(bundle.gateway_token.expose_secret())?;
+    let sandbox_bearer = bundle
+        .sandbox_bearer_slot()
+        .into_diagnostic()
+        .wrap_err("invalid Sandbox Protocol credential")?;
+    let credentials = Arc::new(SessionCredentials {
+        slot: Arc::new(RwLock::new(bearer)),
+        sandbox_bearer: sandbox_bearer.clone(),
+        refresh: std::sync::Mutex::new(None),
+    });
+    SESSION_CREDENTIALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), credentials);
+    Ok(sandbox_bearer)
+}
+
 #[derive(Clone, Debug)]
 enum RefreshMode {
     GatewayJwt(TokenSource),
@@ -304,6 +414,42 @@ impl Drop for ClientSpanStatus {
 /// (one apiserver round-trip per call). The renewal loop itself is
 /// spawned once per process via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
+    let (transport_endpoint, session_key) = split_session_endpoint(endpoint);
+    if let Some(session_key) = session_key {
+        let credentials = session_credentials(session_key).ok_or_else(|| {
+            miette::miette!("supervisor session credentials are not installed or were revoked")
+        })?;
+        let channel = build_plain_channel(transport_endpoint).await?;
+        let plain_channel = channel.clone();
+        let intercepted =
+            InterceptedService::new(channel, AuthInterceptor::new(credentials.slot.clone()));
+        let mut refresh = credentials
+            .refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refresh.is_none() {
+            let refresh_channel = intercepted.clone();
+            let slot = credentials.slot.clone();
+            #[cfg(feature = "jwt")]
+            let sandbox_bearer = Some(credentials.sandbox_bearer.clone());
+            #[cfg(not(feature = "jwt"))]
+            let sandbox_bearer = None;
+            let endpoint = transport_endpoint.to_string();
+            let task = tokio::spawn(async move {
+                refresh_token_loop(
+                    refresh_channel,
+                    slot,
+                    TokenSource::File,
+                    endpoint,
+                    plain_channel,
+                    sandbox_bearer,
+                )
+                .await;
+            });
+            *refresh = Some(task.abort_handle());
+        }
+        return Ok(intercepted);
+    }
     let channel = build_plain_channel(endpoint).await?;
     let (slot, refresh_mode) = token_slot(endpoint, &channel).await?;
     let plain_channel = channel.clone();
@@ -313,7 +459,7 @@ async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
         let refresh_channel = intercepted.clone();
         let endpoint = endpoint.to_string();
         tokio::spawn(async move {
-            refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel).await;
+            refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel, None).await;
         });
     }
     Ok(intercepted)
@@ -421,6 +567,46 @@ async fn acquire_k8s_sandbox_token(
     Ok(resp.into_inner().token)
 }
 
+/// Interceptor for a shared supervisor pool replica. It presents the
+/// replica's projected platform token, re-read on every call because the
+/// kubelet rotates it in place.
+#[derive(Clone, Debug)]
+pub struct PoolMemberInterceptor {
+    token_file: Arc<std::path::PathBuf>,
+}
+
+impl tonic::service::Interceptor for PoolMemberInterceptor {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, Status> {
+        let token = std::fs::read_to_string(self.token_file.as_path())
+            .map_err(|_| Status::unauthenticated("supervisor pool token is unreadable"))?;
+        let bearer = AsciiMetadataValue::try_from(format!("Bearer {}", token.trim()))
+            .map_err(|_| Status::unauthenticated("supervisor pool token is invalid"))?;
+        req.metadata_mut().insert("authorization", bearer);
+        Ok(req)
+    }
+}
+
+/// Gateway client used by a shared supervisor pool replica for pool RPCs.
+pub type PoolMemberClient = OpenShellClient<InterceptedService<Channel, PoolMemberInterceptor>>;
+
+/// Connect a shared supervisor pool replica to the gateway.
+pub async fn connect_supervisor_pool(
+    endpoint: &str,
+    token_file: &std::path::Path,
+) -> Result<PoolMemberClient> {
+    let (transport_endpoint, _) = split_session_endpoint(endpoint);
+    let channel = build_plain_channel(transport_endpoint).await?;
+    Ok(OpenShellClient::new(InterceptedService::new(
+        channel,
+        PoolMemberInterceptor {
+            token_file: Arc::new(token_file.to_path_buf()),
+        },
+    )))
+}
+
 /// Build an authenticated channel for direct external use (e.g. the
 /// long-lived `supervisor_session` control stream).
 pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
@@ -458,6 +644,8 @@ async fn refresh_token_loop(
     source: TokenSource,
     endpoint: String,
     plain_channel: Channel,
+    #[cfg(feature = "jwt")] session_sandbox_bearer: Option<crate::jwt::SessionBearerTokenSlot>,
+    #[cfg(not(feature = "jwt"))] _session_sandbox_bearer: Option<()>,
 ) {
     let mut client = OpenShellClient::new(channel);
     loop {
@@ -494,7 +682,9 @@ async fn refresh_token_loop(
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = gateway_bearer;
                 #[cfg(feature = "jwt")]
-                if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get()
+                if let Some(sandbox_slot) = session_sandbox_bearer
+                    .as_ref()
+                    .or_else(|| SANDBOX_BEARER_SLOT.get())
                     && let Err(error) = sandbox_slot.update(
                         sandbox_refresh.token,
                         sandbox_refresh.expires_at,
@@ -733,6 +923,104 @@ mod auth_tests {
             validate_sandbox_refresh(&response).err(),
             Some(crate::jwt::SessionJwtError::InvalidLifetime)
         );
+    }
+
+    #[test]
+    fn session_scoped_endpoints_keep_the_transport_target() {
+        let scoped = session_scoped_endpoint("https://gateway.example:8080/", "sandbox-a");
+        assert_eq!(
+            split_session_endpoint(&scoped),
+            ("https://gateway.example:8080", Some("sandbox-a"))
+        );
+        assert_eq!(
+            split_session_endpoint("https://gateway.example:8080"),
+            ("https://gateway.example:8080", None)
+        );
+        // Redirects to a peer replica keep the session's credentials.
+        assert_eq!(
+            rescope_endpoint(&scoped, "http://10.0.0.7:8080"),
+            session_scoped_endpoint("http://10.0.0.7:8080", "sandbox-a")
+        );
+        assert_eq!(
+            rescope_endpoint("https://gateway.example:8080", "http://10.0.0.7:8080"),
+            "http://10.0.0.7:8080"
+        );
+    }
+
+    #[cfg(feature = "jwt")]
+    fn test_bundle(sandbox_id: &str) -> crate::jwt::SupervisorAuthBundle {
+        use crate::jwt::{
+            CredentialEpoch, SandboxId, SandboxRuntimeIdentity, SessionJwtIssuer, SessionRotation,
+            SystemJwtClock,
+        };
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("key");
+        let issuer = SessionJwtIssuer::from_ed25519_pem(
+            key.serialize_pem().as_bytes(),
+            "k",
+            "gw",
+            None,
+            Arc::new(SystemJwtClock),
+        )
+        .expect("issuer");
+        let identity = SandboxRuntimeIdentity {
+            sandbox_id: SandboxId::parse(sandbox_id).expect("id"),
+            runtime_generation: crate::sandbox_generation::SandboxGenerationId::parse("g1")
+                .expect("generation"),
+            auth_epoch: CredentialEpoch::new(1).expect("epoch"),
+        };
+        let pair = issuer.mint_pair(&identity).expect("pair");
+        crate::jwt::SupervisorAuthBundle {
+            session_id: crate::SandboxSessionId::new(),
+            runtime_generation: identity.runtime_generation,
+            session_rotation: SessionRotation::new(1).expect("rotation"),
+            auth_epoch: identity.auth_epoch,
+            gateway_token: pair.gateway.token,
+            gateway_expires_at: 0,
+            sandbox_token: pair.sandbox.token,
+            sandbox_expires_at: 0,
+            ssh_host_private_key: None,
+        }
+    }
+
+    #[cfg(feature = "jwt")]
+    #[tokio::test]
+    async fn hosted_sessions_never_share_gateway_credentials() {
+        let endpoint_a = session_scoped_endpoint("http://127.0.0.1:9", "isolation-test-a");
+        let endpoint_b = session_scoped_endpoint("http://127.0.0.1:9", "isolation-test-b");
+        let bundle_a = test_bundle("sandbox-a");
+        let bundle_b = test_bundle("sandbox-b");
+        let bearer_a =
+            install_supervisor_auth_bundle_for_endpoint(&endpoint_a, &bundle_a).expect("a");
+        let bearer_b =
+            install_supervisor_auth_bundle_for_endpoint(&endpoint_b, &bundle_b).expect("b");
+        let gateway_a = session_credentials("isolation-test-a").expect("a creds");
+        let gateway_b = session_credentials("isolation-test-b").expect("b creds");
+        let read = |slot: &TokenSlot| slot.read().unwrap().to_str().unwrap().to_string();
+        assert_eq!(
+            read(&gateway_a.slot),
+            format!("Bearer {}", bundle_a.gateway_token.expose_secret())
+        );
+        assert_eq!(
+            read(&gateway_b.slot),
+            format!("Bearer {}", bundle_b.gateway_token.expose_secret())
+        );
+        assert_ne!(
+            bearer_a.authorization_metadata().unwrap(),
+            bearer_b.authorization_metadata().unwrap()
+        );
+        // The process-wide slot is untouched by hosted sessions.
+        assert!(TOKEN_SLOT.get().is_none());
+
+        // Stopping B revokes only B's credentials.
+        remove_session_credentials(&endpoint_b);
+        assert!(session_credentials("isolation-test-b").is_none());
+        assert!(session_credentials("isolation-test-a").is_some());
+        let Err(error) = connect_channel(&endpoint_b).await else {
+            panic!("revoked session cannot connect");
+        };
+        let error = error.to_string();
+        assert!(error.contains("revoked"), "{error}");
+        remove_session_credentials(&endpoint_a);
     }
 
     #[cfg(feature = "jwt")]

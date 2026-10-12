@@ -792,6 +792,294 @@ mod session {
         }
     }
 
+    /// JOSE `typ` for gateway-signed supervisor ownership authority.
+    pub const SUPERVISOR_AUTHORITY_JWT_TYPE: &str = "openshell-supervisor-authority+jwt";
+    /// Audience accepted only by a sandbox runtime that enabled supervisor recovery.
+    pub const SUPERVISOR_AUTHORITY_AUDIENCE: &str = "openshell-sandbox-supervisor-authority";
+    /// Supervisor authority is short-lived; leases are renewed continuously.
+    pub const MAX_SUPERVISOR_AUTHORITY_TTL: Duration = Duration::from_mins(5);
+    /// Versioned Sandbox Protocol extension that allows fenced supervisor replacement.
+    pub const SUPERVISOR_RECOVERY_PROTOCOL: &str = "supervisor-recovery.v1";
+
+    /// Purpose of one supervisor authority token. Each purpose is accepted
+    /// only by the runtime operation that consumes it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum SupervisorAuthorityKind {
+        /// Lets one candidate fence the previous owner and prepare recovery.
+        RecoveryGrant,
+        /// Lets a prepared candidate resume the frozen workload.
+        Activation,
+        /// Keeps the current owner's enforcement authority alive.
+        Lease,
+    }
+
+    /// Ownership facts signed by the gateway for one sandbox runtime generation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SupervisorAuthority {
+        pub kind: SupervisorAuthorityKind,
+        pub sandbox_id: SandboxId,
+        pub runtime_generation: SandboxGenerationId,
+        /// Monotonic enforcement-ownership epoch, separate from `auth_epoch`.
+        pub ownership_epoch: u64,
+        /// Process-local supervisor instance bound to this authority.
+        pub supervisor_instance: String,
+        /// Candidate's SPKI PEM public key (recovery grants only).
+        pub candidate_key_pem: Option<String>,
+        /// Runtime-issued recovery challenge (recovery grants only).
+        pub challenge: Option<String>,
+        /// SHA-256 of the runtime fencing receipt (activations only).
+        pub receipt_digest: Option<String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SupervisorAuthorityClaims {
+        iss: String,
+        sub: String,
+        aud: String,
+        iat: i64,
+        exp: i64,
+        jti: String,
+        protocol: String,
+        kind: SupervisorAuthorityKind,
+        sandbox_id: SandboxId,
+        runtime_generation: SandboxGenerationId,
+        ownership_epoch: u64,
+        supervisor_instance: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate_key_pem: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        challenge: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt_digest: Option<String>,
+    }
+
+    /// A minted supervisor authority token.
+    #[derive(Clone, Debug)]
+    pub struct MintedSupervisorAuthority {
+        pub token: SecretJwt,
+        pub token_id: Uuid,
+        pub expires_at: i64,
+    }
+
+    /// A supervisor authority token whose signature, issuer, and lifetime were verified.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct VerifiedSupervisorAuthority {
+        pub authority: SupervisorAuthority,
+        pub token_id: Uuid,
+        pub issued_at: i64,
+        pub expires_at: i64,
+    }
+
+    impl SessionJwtIssuer {
+        /// Mint short-lived supervisor ownership authority for one runtime generation.
+        pub fn mint_supervisor_authority(
+            &self,
+            authority: &SupervisorAuthority,
+            ttl: Duration,
+        ) -> Result<MintedSupervisorAuthority, SessionJwtError> {
+            if ttl.is_zero() || ttl > MAX_SUPERVISOR_AUTHORITY_TTL {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            if authority.ownership_epoch == 0 || authority.supervisor_instance.is_empty() {
+                return Err(SessionJwtError::InvalidRuntimeIdentity);
+            }
+            let issued_at = self.clock.now_unix_seconds();
+            let expires_at =
+                issued_at.saturating_add(i64::try_from(ttl.as_secs().max(1)).unwrap_or(i64::MAX));
+            let token_id = Uuid::new_v4();
+            let claims = SupervisorAuthorityClaims {
+                iss: self.issuer.clone(),
+                sub: format!("{SANDBOX_SUBJECT_PREFIX}{}", authority.sandbox_id),
+                aud: SUPERVISOR_AUTHORITY_AUDIENCE.to_string(),
+                iat: issued_at,
+                exp: expires_at,
+                jti: token_id.to_string(),
+                protocol: SUPERVISOR_RECOVERY_PROTOCOL.to_string(),
+                kind: authority.kind,
+                sandbox_id: authority.sandbox_id.clone(),
+                runtime_generation: authority.runtime_generation.clone(),
+                ownership_epoch: authority.ownership_epoch,
+                supervisor_instance: authority.supervisor_instance.clone(),
+                candidate_key_pem: authority.candidate_key_pem.clone(),
+                challenge: authority.challenge.clone(),
+                receipt_digest: authority.receipt_digest.clone(),
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(self.key_id.clone());
+            header.typ = Some(SUPERVISOR_AUTHORITY_JWT_TYPE.to_string());
+            let token = encode(&header, &claims, &self.encoding_key)
+                .map_err(|_| SessionJwtError::SigningFailed)?;
+            Ok(MintedSupervisorAuthority {
+                token: SecretJwt::parse(token)?,
+                token_id,
+                expires_at,
+            })
+        }
+    }
+
+    impl SessionJwtVerifier {
+        /// Verify gateway-signed supervisor authority with the same trusted keys
+        /// that authenticate session tokens.
+        pub fn verify_supervisor_authority(
+            &self,
+            token: &str,
+        ) -> Result<VerifiedSupervisorAuthority, SessionJwtError> {
+            install_crypto_provider();
+            let header = decode_header(token).map_err(|_| SessionJwtError::InvalidToken)?;
+            if header.alg != Algorithm::EdDSA {
+                return Err(SessionJwtError::WrongAlgorithm);
+            }
+            if header.typ.as_deref() != Some(SUPERVISOR_AUTHORITY_JWT_TYPE) {
+                return Err(SessionJwtError::WrongTokenType);
+            }
+            let key_id = header.kid.ok_or(SessionJwtError::MissingKeyId)?;
+            let key = self
+                .keys
+                .get(&key_id)
+                .ok_or(SessionJwtError::UnknownKeyId)?;
+            let mut validation = Validation::new(Algorithm::EdDSA);
+            validation.algorithms = vec![Algorithm::EdDSA];
+            validation.validate_exp = false;
+            validation.validate_aud = false;
+            validation.set_required_spec_claims(&["iss", "aud", "iat", "exp", "sub", "jti"]);
+            let claims = decode::<SupervisorAuthorityClaims>(token, key, &validation)
+                .map_err(|_| SessionJwtError::InvalidToken)?
+                .claims;
+            if claims.iss != self.issuer {
+                return Err(SessionJwtError::WrongIssuer);
+            }
+            if claims.aud != SUPERVISOR_AUTHORITY_AUDIENCE
+                || claims.protocol != SUPERVISOR_RECOVERY_PROTOCOL
+            {
+                return Err(SessionJwtError::WrongAudience);
+            }
+            if claims.sub != format!("{SANDBOX_SUBJECT_PREFIX}{}", claims.sandbox_id) {
+                return Err(SessionJwtError::SubjectMismatch);
+            }
+            let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
+            let now = self.clock.now_unix_seconds();
+            let leeway = i64::try_from(MAX_SESSION_CLOCK_LEEWAY.as_secs()).unwrap_or(30);
+            if claims.iat > now.saturating_add(leeway) {
+                return Err(SessionJwtError::IssuedInFuture);
+            }
+            let max_lifetime =
+                i64::try_from(MAX_SUPERVISOR_AUTHORITY_TTL.as_secs()).unwrap_or(i64::MAX);
+            if claims.exp <= claims.iat || claims.exp.saturating_sub(claims.iat) > max_lifetime {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            // Authority tokens get no expiry leeway: an expired lease must fence.
+            if claims.exp <= now {
+                return Err(SessionJwtError::Expired);
+            }
+            if claims.ownership_epoch == 0 || claims.supervisor_instance.is_empty() {
+                return Err(SessionJwtError::InvalidRuntimeIdentity);
+            }
+            Ok(VerifiedSupervisorAuthority {
+                authority: SupervisorAuthority {
+                    kind: claims.kind,
+                    sandbox_id: claims.sandbox_id,
+                    runtime_generation: claims.runtime_generation,
+                    ownership_epoch: claims.ownership_epoch,
+                    supervisor_instance: claims.supervisor_instance,
+                    candidate_key_pem: claims.candidate_key_pem,
+                    challenge: claims.challenge,
+                    receipt_digest: claims.receipt_digest,
+                },
+                token_id,
+                issued_at: claims.iat,
+                expires_at: claims.exp,
+            })
+        }
+    }
+
+    /// JOSE `typ` for a candidate's proof of possession of its recovery key.
+    pub const RECOVERY_PROOF_JWT_TYPE: &str = "openshell-recovery-proof+jwt";
+    /// JOSE `typ` for a runtime-signed fencing receipt.
+    pub const RECOVERY_RECEIPT_JWT_TYPE: &str = "openshell-recovery-receipt+jwt";
+
+    /// Sign a JSON document with a standalone Ed25519 PKCS#8 key. Used for
+    /// candidate key proofs and runtime fencing receipts, whose keys are not
+    /// gateway issuer keys.
+    pub fn sign_ed25519_document<T: Serialize>(
+        private_key_pem: &[u8],
+        token_type: &str,
+        document: &T,
+    ) -> Result<String, SessionJwtError> {
+        install_crypto_provider();
+        let key = EncodingKey::from_ed_pem(private_key_pem)
+            .map_err(|_| SessionJwtError::InvalidSigningKey)?;
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.typ = Some(token_type.to_string());
+        encode(&header, document, &key).map_err(|_| SessionJwtError::SigningFailed)
+    }
+
+    /// Verify a document signed by [`sign_ed25519_document`] against an SPKI PEM key.
+    pub fn verify_ed25519_document<T: serde::de::DeserializeOwned>(
+        public_key_pem: &[u8],
+        token_type: &str,
+        token: &str,
+    ) -> Result<T, SessionJwtError> {
+        install_crypto_provider();
+        let header = decode_header(token).map_err(|_| SessionJwtError::InvalidToken)?;
+        if header.alg != Algorithm::EdDSA {
+            return Err(SessionJwtError::WrongAlgorithm);
+        }
+        if header.typ.as_deref() != Some(token_type) {
+            return Err(SessionJwtError::WrongTokenType);
+        }
+        let key = DecodingKey::from_ed_pem(public_key_pem)
+            .map_err(|_| SessionJwtError::InvalidVerificationKey)?;
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.algorithms = vec![Algorithm::EdDSA];
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        validation.required_spec_claims.clear();
+        decode::<T>(token, &key, &validation)
+            .map(|data| data.claims)
+            .map_err(|_| SessionJwtError::InvalidToken)
+    }
+
+    /// Candidate proof that it holds the key named in its recovery grant.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RecoveryKeyProof {
+        pub challenge: String,
+        pub grant_id: String,
+        pub supervisor_instance: String,
+    }
+
+    /// Runtime-signed evidence that the previous owner was fenced.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RecoveryReceipt {
+        pub protocol: String,
+        pub sandbox_id: String,
+        pub runtime_generation: String,
+        pub ownership_epoch: u64,
+        pub supervisor_instance: String,
+        pub challenge: String,
+        pub grant_id: String,
+        pub fenced_previous_epoch: u64,
+        pub main_process_id: Option<String>,
+        pub issued_at_unix_ms: u64,
+    }
+
+    /// Digest used to bind an activation token to one exact signed receipt.
+    #[must_use]
+    pub fn recovery_receipt_digest(signed_receipt: &str) -> String {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(signed_receipt.as_bytes());
+        digest
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
     pub enum SessionJwtError {
         #[error("sandbox ID is invalid")]
@@ -998,6 +1286,141 @@ mod tests {
                 auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
             };
             (issuer, gateway, sandbox, identity)
+        }
+
+        fn authority(kind: SupervisorAuthorityKind, epoch: u64) -> SupervisorAuthority {
+            SupervisorAuthority {
+                kind,
+                sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
+                runtime_generation: SandboxGenerationId::parse("generation-1")
+                    .expect("runtime generation"),
+                ownership_epoch: epoch,
+                supervisor_instance: "candidate-1".to_string(),
+                candidate_key_pem: Some("pem".to_string()),
+                challenge: Some("challenge".to_string()),
+                receipt_digest: None,
+            }
+        }
+
+        #[test]
+        fn supervisor_authority_round_trips_and_is_not_a_session_token() {
+            let (issuer, _gateway, sandbox, identity) = fixture();
+            let expected = authority(SupervisorAuthorityKind::RecoveryGrant, 2);
+            let minted = issuer
+                .mint_supervisor_authority(&expected, std::time::Duration::from_secs(30))
+                .expect("mint authority");
+            let verified = sandbox
+                .verify_supervisor_authority(minted.token.expose_secret())
+                .expect("verify authority");
+            assert_eq!(verified.authority, expected);
+            assert_eq!(verified.token_id, minted.token_id);
+            // An authority token cannot authenticate a session, and a session
+            // token cannot carry supervisor authority.
+            assert_eq!(
+                sandbox.verify(minted.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+            let pair = issuer.mint_pair(&identity).expect("mint pair");
+            assert_eq!(
+                sandbox.verify_supervisor_authority(pair.sandbox.token.expose_secret()),
+                Err(SessionJwtError::WrongTokenType)
+            );
+        }
+
+        #[test]
+        fn supervisor_authority_rejects_long_lifetimes_and_zero_epochs() {
+            let (issuer, _gateway, _sandbox, _identity) = fixture();
+            assert_eq!(
+                issuer
+                    .mint_supervisor_authority(
+                        &authority(SupervisorAuthorityKind::Lease, 1),
+                        MAX_SUPERVISOR_AUTHORITY_TTL + std::time::Duration::from_secs(1),
+                    )
+                    .err(),
+                Some(SessionJwtError::InvalidLifetime)
+            );
+            assert_eq!(
+                issuer
+                    .mint_supervisor_authority(
+                        &authority(SupervisorAuthorityKind::Lease, 0),
+                        std::time::Duration::from_secs(10),
+                    )
+                    .err(),
+                Some(SessionJwtError::InvalidRuntimeIdentity)
+            );
+        }
+
+        #[test]
+        fn supervisor_authority_expires_without_leeway() {
+            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
+            let issuer = SessionJwtIssuer::from_ed25519_pem(
+                key.serialize_pem().as_bytes(),
+                "current",
+                "test",
+                None,
+                Arc::new(FixedClock(1_900_000_000)),
+            )
+            .expect("issuer");
+            let later = SessionJwtVerifier::new(
+                "test",
+                SessionTokenProfile::Sandbox,
+                [SessionVerificationKey {
+                    key_id: "current".to_string(),
+                    public_key_pem: key.public_key_pem().into_bytes(),
+                }],
+                Arc::new(FixedClock(1_900_000_010)),
+            )
+            .expect("verifier");
+            let minted = issuer
+                .mint_supervisor_authority(
+                    &authority(SupervisorAuthorityKind::Lease, 1),
+                    std::time::Duration::from_secs(10),
+                )
+                .expect("mint");
+            assert_eq!(
+                later.verify_supervisor_authority(minted.token.expose_secret()),
+                Err(SessionJwtError::Expired)
+            );
+        }
+
+        #[test]
+        fn ed25519_documents_bind_type_and_key() {
+            let key = KeyPair::generate_for(&PKCS_ED25519).expect("key");
+            let other = KeyPair::generate_for(&PKCS_ED25519).expect("other key");
+            let proof = RecoveryKeyProof {
+                challenge: "c".to_string(),
+                grant_id: "g".to_string(),
+                supervisor_instance: "i".to_string(),
+            };
+            let signed = sign_ed25519_document(
+                key.serialize_pem().as_bytes(),
+                RECOVERY_PROOF_JWT_TYPE,
+                &proof,
+            )
+            .expect("sign");
+            let verified: RecoveryKeyProof = verify_ed25519_document(
+                key.public_key_pem().as_bytes(),
+                RECOVERY_PROOF_JWT_TYPE,
+                &signed,
+            )
+            .expect("verify");
+            assert_eq!(verified, proof);
+            assert!(
+                verify_ed25519_document::<RecoveryKeyProof>(
+                    other.public_key_pem().as_bytes(),
+                    RECOVERY_PROOF_JWT_TYPE,
+                    &signed,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                verify_ed25519_document::<RecoveryKeyProof>(
+                    key.public_key_pem().as_bytes(),
+                    RECOVERY_RECEIPT_JWT_TYPE,
+                    &signed,
+                ),
+                Err(SessionJwtError::WrongTokenType)
+            );
         }
 
         #[test]

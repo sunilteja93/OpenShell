@@ -34,6 +34,8 @@ pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     pub provider_credentials: ProviderCredentialState,
     pub sandbox_bearer: SessionBearerTokenSlot,
+    /// Gateway-managed ownership for a hosted session in gateway topology.
+    pub ownership: Option<openshell_sandbox_backend::ownership::SupervisorOwnership>,
 }
 
 /// Selected by trusted composition, never by payload contents. Decoding and
@@ -236,13 +238,15 @@ impl PreparedBackend for OpenShellLaunch {
         self: Box<Self>,
         services: BackendServices,
     ) -> std::result::Result<Arc<dyn IsolationBackend>, BackendError> {
-        Ok(Arc::new(
-            openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-                services.ca_file_paths,
-                services.provider_credentials,
-                services.sandbox_bearer,
-            ),
-        ))
+        let backend = openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+            services.ca_file_paths,
+            services.provider_credentials,
+            services.sandbox_bearer,
+        );
+        Ok(Arc::new(match services.ownership {
+            Some(ownership) => backend.with_ownership(ownership),
+            None => backend,
+        }))
     }
 }
 

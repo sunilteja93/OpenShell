@@ -2182,14 +2182,23 @@ async fn establish_supervisor_session(
         ToString::to_string,
     );
     let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    // In the gateway supervisor topology, a session from the current
+    // enforcement owner supersedes a stale routing record from a fenced
+    // owner instead of waiting for its TTL. The caller already passed the
+    // gateway token check, whose lineage rotates on every recovery.
+    let ownership_epoch = match state.supervisor_pool.as_ref() {
+        Some(pool) => pool.ownership_epoch(&sandbox_id).await.unwrap_or(0),
+        None => 0,
+    };
     let owner_guard = owner_index
-        .publish(
+        .publish_with_ownership(
             &sandbox_id,
             &session_id,
             &hello.instance_id,
             hello.connection_epoch,
             &state.replica_id,
             &owner_peer_endpoint,
+            ownership_epoch,
         )
         .await
         .map_err(owner_error_to_status)?;
@@ -4380,6 +4389,7 @@ mod tests {
             connected_at_ms: 0,
             updated_at_ms: openshell_core::time::now_ms(),
             resource_version: 1,
+            ownership_epoch: 0,
         }
     }
 

@@ -280,6 +280,7 @@ pub fn bootstrap_archives(
         workload_identity: identity.clone(),
         outer_fence: outer_fence.clone(),
         child_env: child_env.clone(),
+        supervisor_recovery: None,
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
         boundary_id: sandbox_id.into(),
@@ -296,6 +297,7 @@ pub fn bootstrap_archives(
         resource_claims,
         workload_identity: identity.clone(),
         outer_fence,
+        supervisor_recovery: None,
     };
     // Libpod resolves the requested upload destination once for a stopped
     // container. Archive entries must be relative to the selected named volume,

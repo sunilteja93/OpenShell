@@ -2321,6 +2321,26 @@ impl ComputeRuntime {
         }
     }
 
+    /// Record that fenced supervisor recovery could not finish in time. The
+    /// runtime terminates the frozen workload at its own deadline; this makes
+    /// the outcome visible instead of silently restarting the sandbox.
+    pub(crate) async fn mark_supervisor_recovery_failed(&self, sandbox_id: &str, message: &str) {
+        let Ok(Some(sandbox)) = self.store.get_message::<Sandbox>(sandbox_id).await else {
+            return;
+        };
+        if let Err(error) = self
+            .write_lifecycle_phase(
+                &sandbox,
+                SandboxPhase::Error,
+                "SupervisorRecoveryFailed",
+                message,
+            )
+            .await
+        {
+            warn!(sandbox_id, %error, "Failed to record supervisor recovery failure");
+        }
+    }
+
     async fn write_lifecycle_phase(
         &self,
         sandbox: &Sandbox,

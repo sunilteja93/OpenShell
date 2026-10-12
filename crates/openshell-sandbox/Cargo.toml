@@ -70,6 +70,7 @@ tracing-subscriber = { workspace = true }
 libc = "0.2"
 rustix = { workspace = true }
 russh-sftp = "3.0"
+thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -42,6 +42,7 @@ use crate::boundary_protocol::{
     encode_frame, read_stream_frame, validate_resource_claims, write_stream_frame,
 };
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
+use crate::ownership::{OwnershipMode, RecoveryGrantRequest, SupervisorOwnership};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Initial attachment may include runtime image pulls and trusted bootstrap
@@ -58,6 +59,8 @@ const CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Relay and pending-accept streams share the boundary's concurrent stream
 /// limit with exec and control exchanges; leave the remainder for those.
 const MAX_NETWORK_STREAMS: usize = 96;
+/// An owner stops acting this long before its runtime lease would lapse.
+const OWNERSHIP_LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(2);
 const _: () = assert!(
     MAX_NETWORK_STREAMS < crate::boundary_protocol::BOUNDARY_MAX_CONCURRENT_STREAMS as usize
 );
@@ -76,6 +79,7 @@ pub struct OpenShellRuntimeBackend {
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    ownership: Option<SupervisorOwnership>,
 }
 
 impl OpenShellRuntimeBackend {
@@ -102,8 +106,99 @@ impl OpenShellRuntimeBackend {
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
+            ownership: None,
         }
     }
+
+    /// Bind this backend to gateway-managed enforcement ownership
+    /// (`supervisor-recovery.v1`). Without a binding the backend keeps
+    /// dedicated, same-process recovery semantics.
+    #[must_use]
+    pub fn with_ownership(mut self, ownership: SupervisorOwnership) -> Self {
+        self.ownership = Some(ownership);
+        self
+    }
+}
+
+/// Recovery facts the runtime returned to a replacement supervisor.
+struct RecoveredBoundary {
+    receipt: String,
+    attached_policy: Option<Box<SandboxPolicyWire>>,
+    main_process_id: Option<String>,
+    provider_env_generation: u64,
+    state_revision: u64,
+}
+
+/// Fence the previous owner through the runtime's recovery extension.
+async fn recover_boundary(
+    client: &BoundaryClient,
+    ownership: &SupervisorOwnership,
+) -> Result<RecoveredBoundary, BackendError> {
+    let response = client.call_once(Request::RecoveryHello).await?;
+    let Response::RecoveryChallenge {
+        protocol,
+        challenge,
+        ownership_epoch,
+        ..
+    } = response
+    else {
+        return Err(unexpected_response("recovery_challenge", &response));
+    };
+    if protocol != openshell_core::jwt::SUPERVISOR_RECOVERY_PROTOCOL {
+        return Err(BackendError::Unsupported(format!(
+            "runtime recovery protocol {protocol:?} is not supported"
+        )));
+    }
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .map_err(|error| BackendError::Attach(format!("generate recovery key: {error}")))?;
+    let instance = client.supervisor_instance_id.to_string();
+    let grant = ownership
+        .authority
+        .recovery_grant(RecoveryGrantRequest {
+            supervisor_instance: instance.clone(),
+            candidate_key_pem: key.public_key_pem(),
+            challenge: challenge.clone(),
+            runtime_ownership_epoch: ownership_epoch,
+        })
+        .await?;
+    let proof = openshell_core::jwt::sign_ed25519_document(
+        key.serialize_pem().as_bytes(),
+        openshell_core::jwt::RECOVERY_PROOF_JWT_TYPE,
+        &openshell_core::jwt::RecoveryKeyProof {
+            challenge,
+            grant_id: grant.grant_id,
+            supervisor_instance: instance,
+        },
+    )
+    .map_err(|error| BackendError::Attach(format!("sign recovery key proof: {error}")))?;
+    let response = client
+        .call_once(Request::Recover {
+            grant: grant.grant,
+            proof,
+        })
+        .await?;
+    let Response::Recovered {
+        receipt,
+        attached_policy,
+        main_process_id,
+        provider_env_generation,
+        state,
+        ..
+    } = response
+    else {
+        return Err(unexpected_response("recovered", &response));
+    };
+    let state_revision = state.as_ref().map_or(0, |state| state.revision);
+    if let Some(state) = state {
+        ownership.pin_journal.restore(state.binary_pins);
+    }
+    Ok(RecoveredBoundary {
+        receipt,
+        attached_policy,
+        main_process_id,
+        provider_env_generation,
+        state_revision,
+    })
 }
 
 #[async_trait]
@@ -122,6 +217,12 @@ impl IsolationBackend for OpenShellRuntimeBackend {
                 BackendError::Descriptor(format!("decode runtime descriptor: {error}"))
             })?;
         validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
+        if self.ownership.is_some() && runtime_descriptor.supervisor_recovery.is_none() {
+            return Err(BackendError::Unsupported(
+                "gateway supervisor topology requires a runtime with supervisor-recovery.v1"
+                    .to_string(),
+            ));
+        }
         let host_gateway_ip = runtime_descriptor.host_gateway_ip;
         let resource_claims = runtime_descriptor.resource_claims.clone();
         let generation = runtime_descriptor.generation.clone();
@@ -131,10 +232,24 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             runtime_descriptor,
             self.sandbox_bearer.clone(),
         ));
+        let recovered = match self
+            .ownership
+            .as_ref()
+            .filter(|ownership| ownership.mode == OwnershipMode::Recover)
+        {
+            Some(ownership) => Some(recover_boundary(&client, ownership).await?),
+            None => None,
+        };
+        // A replacement reattaches with the exact policy the runtime bound at
+        // launch; network policy still comes from the gateway.
+        let attach_policy = recovered
+            .as_ref()
+            .and_then(|recovered| recovered.attached_policy.clone())
+            .unwrap_or_else(|| Box::new(SandboxPolicyWire::from(sandbox.policy.clone())));
         let response = client
             .call_idempotent(Request::Attach {
                 supervisor_instance_id: client.supervisor_instance_id,
-                policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
+                policy: attach_policy,
                 resource_claims: resource_claims.clone(),
             })
             .await?;
@@ -160,6 +275,8 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             session_id,
             resource_claims,
             outer_fence,
+            ownership: self.ownership.clone(),
+            recovered,
         }))
     }
 }
@@ -305,6 +422,8 @@ struct RemoteBound {
     session_id: openshell_core::SandboxSessionId,
     resource_claims: std::collections::BTreeMap<String, String>,
     outer_fence: openshell_isolation_interface::contract::OuterFenceGuarantees,
+    ownership: Option<SupervisorOwnership>,
+    recovered: Option<RecoveredBoundary>,
 }
 
 #[async_trait]
@@ -318,7 +437,25 @@ impl BoundBoundary for RemoteBound {
     }
 
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
-        let response = self.client.call_idempotent(Request::Confirm).await?;
+        let response = match (&self.ownership, &self.recovered) {
+            (Some(ownership), Some(recovered)) => {
+                let activation = ownership
+                    .authority
+                    .activate(
+                        &self.client.supervisor_instance_id.to_string(),
+                        &recovered.receipt,
+                    )
+                    .await?;
+                let response = self
+                    .client
+                    .call_once(Request::ConfirmRecovery { activation })
+                    .await?;
+                // Later transport recovery reconfirms with a plain confirm.
+                self.client.remember_plain_confirm()?;
+                response
+            }
+            _ => self.client.call_idempotent(Request::Confirm).await?,
+        };
         let Response::Confirmed { confirmation } = response else {
             return Err(unexpected_response("confirmed", &response));
         };
@@ -346,6 +483,13 @@ impl BoundBoundary for RemoteBound {
             ));
         }
         let client = self.client.clone();
+        let state_revision = self
+            .recovered
+            .as_ref()
+            .map_or(0, |recovered| recovered.state_revision);
+        let resumed = self
+            .recovered
+            .map(|recovered| (recovered.main_process_id, recovered.provider_env_generation));
         let confirmed = ConfirmedBoundary::try_new(
             Box::new(RemoteReady {
                 client: self.client,
@@ -354,11 +498,15 @@ impl BoundBoundary for RemoteBound {
                 sandbox_id: self.sandbox_id,
                 ca_file_paths: self.ca_file_paths,
                 provider_credentials: self.provider_credentials,
+                resumed,
             }),
             *confirmation,
             &self.identity,
         )?;
         client.start_credential_monitor();
+        if let Some(ownership) = self.ownership {
+            client.start_ownership_tasks(ownership, state_revision);
+        }
         Ok(confirmed)
     }
 }
@@ -370,11 +518,37 @@ struct RemoteReady {
     sandbox_id: String,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
+    /// Set when this boundary was recovered from a previous owner: the
+    /// existing main process and provider publication generation.
+    resumed: Option<(Option<String>, u64)>,
 }
 
 #[async_trait]
 impl ReadyBoundary for RemoteReady {
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError> {
+        if let Some((main_process_id, provider_env_generation)) = self.resumed {
+            // A recovered boundary never starts a workload: it reattaches to
+            // the process the previous owner started.
+            let process_id = main_process_id.ok_or_else(|| {
+                BackendError::Process(
+                    "recovered boundary has no running main process to resume".to_string(),
+                )
+            })?;
+            return Ok(Box::new(RemoteRunning {
+                process: Arc::new(RemoteProcess {
+                    client: self.client.clone(),
+                    process_id,
+                }),
+                exec: Arc::new(RemoteExec {
+                    client: self.client.clone(),
+                    provider_credentials: self.provider_credentials,
+                    publication_generation: tokio::sync::Mutex::new(provider_env_generation),
+                }),
+                loopback_connector: Arc::new(RemoteLoopbackConnector {
+                    client: self.client,
+                }),
+            }));
+        }
         let ca_paths = self
             .ca_file_paths
             .lock()
@@ -1102,6 +1276,9 @@ struct BoundaryClient {
     credential_monitor_started: AtomicBool,
     network_streams: Arc<tokio::sync::Semaphore>,
     network_streams_exhausted: AtomicBool,
+    /// Set once this owner lost enforcement authority; no further request
+    /// may reach the runtime.
+    fenced: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -1265,7 +1442,123 @@ impl BoundaryClient {
             credential_monitor_started: AtomicBool::new(false),
             network_streams: Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS)),
             network_streams_exhausted: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
         }
+    }
+
+    /// Send one non-replayable request with a fresh envelope.
+    async fn call_once(&self, request: Request) -> Result<Response, BackendError> {
+        let envelope = Self::prepare_request(request)?;
+        tokio::time::timeout(REQUEST_TIMEOUT, self.exchange_envelope(&envelope))
+            .await
+            .map_err(|_| {
+                BackendError::Unavailable("boundary control request timed out".to_string())
+            })?
+    }
+
+    fn remember_plain_confirm(&self) -> Result<(), BackendError> {
+        let envelope = Self::prepare_request(Request::Confirm)?;
+        *self
+            .confirm_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(envelope);
+        Ok(())
+    }
+
+    /// Stop acting for this boundary and close the physical transport so the
+    /// runtime freezes the workload immediately.
+    async fn self_fence(&self) {
+        self.fenced.store(true, Ordering::Release);
+        let cached = self.grpc_channel.lock().await.take();
+        if let Some(cached) = cached {
+            cached.transport.abort();
+        }
+        *self.mediation.lock().await = None;
+    }
+
+    /// Renew the enforced lease and checkpoint recovery state while this
+    /// supervisor owns the boundary.
+    fn start_ownership_tasks(self: &Arc<Self>, ownership: SupervisorOwnership, revision_base: u64) {
+        let instance = self.supervisor_instance_id.to_string();
+        let client = Arc::downgrade(self);
+        let lease_ownership = ownership.clone();
+        tokio::spawn(async move {
+            // The runtime started this owner's lease at confirm.
+            let mut last_renewal = tokio::time::Instant::now();
+            let margin = OWNERSHIP_LEASE_SAFETY_MARGIN.min(lease_ownership.lease_ttl / 2);
+            let mut ticker = tokio::time::interval(lease_ownership.lease_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(client) = client.upgrade() else {
+                    return;
+                };
+                if client.fenced.load(Ordering::Acquire) {
+                    return;
+                }
+                let renewal = async {
+                    let lease = lease_ownership.authority.lease(&instance).await?;
+                    client.call_once(Request::RenewLease { lease }).await
+                }
+                .await;
+                match renewal {
+                    Ok(Response::LeaseRenewed { .. }) => {
+                        last_renewal = tokio::time::Instant::now();
+                    }
+                    Ok(response) => {
+                        tracing::warn!(?response, "Unexpected supervisor lease response");
+                    }
+                    Err(BackendError::Denied(message) | BackendError::Terminated(message)) => {
+                        tracing::error!(%message, "Supervisor ownership revoked; self-fencing");
+                        client.self_fence().await;
+                        lease_ownership.authority.fenced(&message);
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Supervisor lease renewal failed; retrying");
+                    }
+                }
+                if last_renewal.elapsed() + margin >= lease_ownership.lease_ttl {
+                    let reason = "supervisor lease could not be renewed before expiry";
+                    tracing::error!(reason, "Supervisor self-fencing");
+                    client.self_fence().await;
+                    lease_ownership.authority.fenced(reason);
+                    return;
+                }
+            }
+        });
+        let client = Arc::downgrade(self);
+        let journal = ownership.pin_journal;
+        tokio::spawn(async move {
+            let mut learned = journal.subscribe_learned();
+            loop {
+                if learned.changed().await.is_err() {
+                    return;
+                }
+                let Some(client) = client.upgrade() else {
+                    return;
+                };
+                let (revision, binary_pins) = journal.snapshot();
+                let state = crate::boundary_protocol::SupervisorRecoveryStateWire {
+                    revision: revision_base.saturating_add(revision),
+                    binary_pins,
+                    policy_version: 0,
+                };
+                match client
+                    .call_once(Request::StoreRecoveryState { state })
+                    .await
+                {
+                    Ok(Response::RecoveryStateStored { .. }) => journal.mark_durable(revision),
+                    Ok(response) => {
+                        tracing::warn!(?response, "Unexpected recovery state response");
+                    }
+                    Err(error) => {
+                        // Unacknowledged pins never authorize traffic.
+                        tracing::warn!(%error, "Recovery state checkpoint failed");
+                    }
+                }
+            }
+        });
     }
 
     async fn acquire_network_stream(&self) -> tokio::sync::OwnedSemaphorePermit {
@@ -1502,6 +1795,11 @@ impl BoundaryClient {
         &self,
         kind: GrpcStreamKind,
     ) -> Result<BoundaryDuplexStream, BackendError> {
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(BackendError::Terminated(
+                "boundary process leaf: supervisor ownership was fenced".to_string(),
+            ));
+        }
         self.ensure_current_credential_connection().await?;
         let channel = self.grpc_channel().await?;
         open_grpc_client_stream(channel, kind, &self.sandbox_bearer).await
@@ -2365,6 +2663,14 @@ mod tests {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
                                 message: "no pending network request".to_string(),
                             },
+                            Request::RecoveryHello
+                            | Request::Recover { .. }
+                            | Request::ConfirmRecovery { .. }
+                            | Request::RenewLease { .. }
+                            | Request::StoreRecoveryState { .. } => Response::Error {
+                                kind: crate::boundary_protocol::BoundaryErrorKind::Invalid,
+                                message: "supervisor recovery is not enabled".to_string(),
+                            },
                         },
                     }) {
                         Ok(response) => response,
@@ -2788,6 +3094,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_recovery: None,
         }
     }
 
@@ -2980,6 +3287,8 @@ mod tests {
             session_id: test_session_id(),
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence,
+            ownership: None,
+            recovered: None,
         };
 
         assert!(matches!(
@@ -3050,6 +3359,7 @@ mod tests {
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_recovery: None,
         };
         let debug = format!("{runtime_descriptor:?}");
         assert!(debug.contains("<redacted>"));
@@ -3070,6 +3380,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_recovery: None,
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -3092,6 +3403,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_recovery: None,
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -3114,6 +3426,7 @@ mod tests {
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             outer_fence: test_outer_fence(),
+            supervisor_recovery: None,
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox())
             .expect("TCP runtime descriptor should be valid");
@@ -3345,6 +3658,7 @@ mod tests {
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
+                supervisor_recovery: None,
             },
             test_bearer(&"a".repeat(32)),
         ));
@@ -3413,6 +3727,7 @@ mod tests {
             sandbox_id: context.sandbox_id,
             ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
             provider_credentials: credentials.clone(),
+            resumed: None,
         });
         let running = ready.start_agent().await.unwrap();
         assert_eq!(requests.load(Ordering::Acquire), 1);
@@ -3538,6 +3853,7 @@ mod tests {
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
                 outer_fence: test_outer_fence(),
+                supervisor_recovery: None,
             },
             test_bearer(&"a".repeat(32)),
         );

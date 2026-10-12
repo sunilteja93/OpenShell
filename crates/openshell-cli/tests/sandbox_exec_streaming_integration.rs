@@ -163,6 +163,49 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
+            async fn sync_supervisor_pool(
+                &self,
+                _request: tonic::Request<openshell_core::proto::SyncSupervisorPoolRequest>,
+            ) -> Result<tonic::Response<openshell_core::proto::SyncSupervisorPoolResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
+            async fn get_supervisor_assignment(
+                &self,
+                _request: tonic::Request<openshell_core::proto::GetSupervisorAssignmentRequest>,
+            ) -> Result<tonic::Response<openshell_core::proto::GetSupervisorAssignmentResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
+            async fn request_supervisor_recovery_grant(
+                &self,
+                _request: tonic::Request<openshell_core::proto::RequestSupervisorRecoveryGrantRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::RequestSupervisorRecoveryGrantResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
+            async fn activate_supervisor_assignment(
+                &self,
+                _request: tonic::Request<openshell_core::proto::ActivateSupervisorAssignmentRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::ActivateSupervisorAssignmentResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
+            async fn renew_supervisor_lease(
+                &self,
+                _request: tonic::Request<openshell_core::proto::RenewSupervisorLeaseRequest>,
+            ) -> Result<tonic::Response<openshell_core::proto::RenewSupervisorLeaseResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not implemented in test"))
+            }
+
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*

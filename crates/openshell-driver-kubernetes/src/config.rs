@@ -290,6 +290,11 @@ pub struct KubernetesComputeConfig {
     /// When empty and `sandbox_uid` is set, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+
+    /// Gateway-level supervisor placement. Set only by the gateway from
+    /// `[openshell.gateway] supervisor_topology`, never from driver TOML.
+    #[serde(skip)]
+    pub supervisor_topology: config::SupervisorTopology,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -368,6 +373,7 @@ impl Default for KubernetesComputeConfig {
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
+            supervisor_topology: config::SupervisorTopology::Dedicated,
         }
     }
 }
@@ -376,10 +382,32 @@ impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
         self.validate_workspace_mode()?;
+        self.validate_supervisor_topology()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()
+    }
+
+    /// The shared supervisor Deployment lives in the sandbox namespace so the
+    /// namespace-wide workload fence admits it. Workspace modes with several
+    /// sandbox namespaces would need cross-namespace fencing and scoped pool
+    /// placement, which this topology does not provide yet.
+    pub fn validate_supervisor_topology(&self) -> Result<(), String> {
+        if self.supervisor_topology == config::SupervisorTopology::Gateway
+            && self.workspace_mode != WorkspaceMode::Shared
+        {
+            return Err(format!(
+                "supervisor_topology = \"gateway\" requires workspace_mode = \"shared\" (got \"{}\")",
+                self.workspace_mode
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn shared_supervisor_pool(&self) -> bool {
+        self.supervisor_topology == config::SupervisorTopology::Gateway
     }
 
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,

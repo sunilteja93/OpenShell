@@ -407,6 +407,9 @@ fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) ->
 }
 
 fn supervisor_gateway_endpoint_from_env() -> Result<String> {
+    if let Some(session) = openshell_core::hosted_session::current() {
+        return Ok(session.endpoint.clone());
+    }
     std::env::var(sandbox_env::ENDPOINT)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -414,6 +417,9 @@ fn supervisor_gateway_endpoint_from_env() -> Result<String> {
 }
 
 fn supervisor_sandbox_id_from_env() -> Result<String> {
+    if let Some(session) = openshell_core::hosted_session::current() {
+        return Ok(session.sandbox_id.clone());
+    }
     std::env::var(sandbox_env::SANDBOX_ID)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -440,8 +446,14 @@ struct TokenCacheKeyInput<'a> {
 }
 
 fn token_cache_key(input: TokenCacheKeyInput<'_>) -> String {
+    // Tokens are scoped to the hosted sandbox session: two sandboxes in one
+    // shared supervisor never reuse each other's provider access tokens.
+    let session = openshell_core::hosted_session::current()
+        .map(|session| session.sandbox_id.clone())
+        .unwrap_or_default();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        session,
         input.provider_name,
         input.token_endpoint,
         input.jwt_svid_audience,
@@ -956,6 +968,58 @@ mod tests {
         assert_ne!(base, different_audience);
         assert_ne!(base, different_scopes);
         assert_ne!(base, different_assertion_type);
+    }
+
+    #[test]
+    fn hosted_sessions_never_share_provider_token_cache_entries() {
+        use openshell_core::hosted_session::{HostedSessionIdentity, bind_current_thread};
+        use std::sync::Arc;
+
+        fn key_and_identity_in(session: &'static str) -> (String, String, String) {
+            std::thread::spawn(move || {
+                bind_current_thread(Some(Arc::new(HostedSessionIdentity {
+                    sandbox_id: session.to_string(),
+                    sandbox_name: session.to_string(),
+                    endpoint: format!(
+                        "https://gateway:8080/?openshell-supervisor-session={session}"
+                    ),
+                })));
+                let scopes = ["alpha".to_string()];
+                let key = token_cache_key(TokenCacheKeyInput {
+                    provider_name: "shared-provider",
+                    token_endpoint: "https://auth.example.com/token",
+                    jwt_svid_audience: "https://auth.example.com",
+                    client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+                    audience: "alpha",
+                    scopes: &scopes,
+                    grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+                    requested_token_type: ACCESS_TOKEN_TYPE,
+                });
+                (
+                    key,
+                    supervisor_sandbox_id_from_env().unwrap(),
+                    supervisor_gateway_endpoint_from_env().unwrap(),
+                )
+            })
+            .join()
+            .unwrap()
+        }
+
+        let (alpha_key, alpha_id, alpha_endpoint) = key_and_identity_in("sandbox-alpha");
+        let (beta_key, beta_id, beta_endpoint) = key_and_identity_in("sandbox-beta");
+        assert_ne!(
+            alpha_key, beta_key,
+            "identical provider requests from two hosted sandboxes must not share a cache entry"
+        );
+        assert_eq!(alpha_id, "sandbox-alpha");
+        assert_eq!(beta_id, "sandbox-beta");
+        assert!(alpha_endpoint.ends_with("session=sandbox-alpha"));
+        assert!(beta_endpoint.ends_with("session=sandbox-beta"));
+        assert_eq!(
+            key_and_identity_in("sandbox-alpha").0,
+            alpha_key,
+            "a session keeps reusing its own cache entry"
+        );
     }
 
     #[test]

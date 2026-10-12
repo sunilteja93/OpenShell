@@ -22,6 +22,8 @@ pub mod process;
 #[cfg(target_os = "linux")]
 mod provider_files;
 mod pty;
+#[cfg(target_os = "linux")]
+mod recovery_ownership;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;

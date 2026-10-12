@@ -19,6 +19,7 @@ mod logging;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
+const POOL_SUBCOMMAND: &str = "pool";
 const SERVICE_NAME: &str = "openshell-supervisor";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -36,6 +37,92 @@ struct HealthArgs {
     /// Private supervisor readiness socket.
     #[arg(long, env = "OPENSHELL_HEALTH_SOCKET_PATH")]
     socket: PathBuf,
+}
+
+/// Shared supervisor replica for the gateway supervisor topology.
+#[derive(Parser, Debug)]
+#[command(name = "openshell-supervisor pool")]
+struct PoolArgs {
+    /// Gateway endpoint shared by every hosted session.
+    #[arg(long, env = openshell_core::sandbox_env::ENDPOINT)]
+    openshell_endpoint: String,
+
+    /// Projected platform token that authenticates this replica.
+    #[arg(long, env = openshell_core::sandbox_env::K8S_SA_TOKEN_FILE)]
+    token_file: PathBuf,
+
+    /// Per-session state root.
+    #[arg(long, default_value = "/run/openshell/sessions")]
+    session_root: PathBuf,
+
+    /// TCP port that accepts connections once the replica registered.
+    #[arg(long, env = "OPENSHELL_HEALTH_PORT")]
+    health_port: Option<u16>,
+
+    #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
+    log_level: String,
+
+    #[arg(long)]
+    upstream_proxy: Option<String>,
+
+    #[arg(long)]
+    upstream_no_proxy: Option<String>,
+}
+
+fn pool_main(args: PoolArgs) -> Result<()> {
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .into_diagnostic()?;
+    runtime.block_on(async move {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (logging_layers, _logging_guards, _file_available) = logging::layers(
+            std::io::stderr(),
+            Path::new("/var/log"),
+            console_filter,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(String::new())),
+        );
+        tracing_subscriber::registry()
+            .with(logging_layers)
+            .with(openshell_supervisor_process::log_push::LogPushLayer::session_routed())
+            .init();
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        if let Some(port) = args.health_port {
+            tokio::spawn(async move {
+                if ready_rx.wait_for(|ready| *ready).await.is_err() {
+                    return;
+                }
+                let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        warn!(%error, port, "Supervisor pool readiness listener failed");
+                        return;
+                    }
+                };
+                loop {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        drop(stream);
+                    }
+                }
+            });
+        }
+        info!(endpoint = %args.openshell_endpoint, "Starting shared supervisor replica");
+        openshell_supervisor::pool::run_pool(openshell_supervisor::pool::PoolConfig {
+            endpoint: args.openshell_endpoint,
+            token_file: args.token_file,
+            session_root: args.session_root,
+            upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs {
+                https_proxy: args.upstream_proxy,
+                no_proxy: args.upstream_no_proxy,
+                ..Default::default()
+            },
+            ready: Some(ready_tx),
+        })
+        .await
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -294,6 +381,9 @@ fn main() -> Result<()> {
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
+    }
+    if raw_args.get(1).map(String::as_str) == Some(POOL_SUBCOMMAND) {
+        return pool_main(PoolArgs::parse_from(&raw_args[1..]));
     }
     if raw_args.get(1).map(String::as_str) == Some(HEALTH_SUBCOMMAND) {
         let args = HealthArgs::parse_from(&raw_args[1..]);

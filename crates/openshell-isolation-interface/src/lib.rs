@@ -49,6 +49,7 @@ pub struct AgentSpec {
 }
 
 pub mod contract;
+pub mod recovery_state;
 
 /// Linux-only primitives shared by capability-free sandbox implementations.
 #[cfg(target_os = "linux")]

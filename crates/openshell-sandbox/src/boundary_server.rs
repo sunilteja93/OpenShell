@@ -249,6 +249,7 @@ mod linux {
             launcher,
             qualification,
         )?);
+        runtime.start_lease_watchdog();
         serve(&config.listener, runtime)
     }
 
@@ -1125,7 +1126,7 @@ mod linux {
 
     fn serve_one(
         mut stream: ControlStream,
-        runtime: &BoundaryRuntime,
+        runtime: &Arc<BoundaryRuntime>,
         principal: &SandboxProtocolPrincipal,
     ) -> Result<(), String> {
         stream
@@ -1144,6 +1145,17 @@ mod linux {
             };
             return write_frame(&mut stream, &response)
                 .map_err(|error| format!("write control frame: {error}"));
+        }
+        if request.request.is_supervisor_recovery() {
+            let response = runtime.handle_supervisor_recovery(principal, request.request);
+            return write_frame(
+                &mut stream,
+                &ResponseEnvelope {
+                    request_id: request.request_id,
+                    response,
+                },
+            )
+            .map_err(|error| format!("write supervisor recovery response: {error}"));
         }
         match request.request.clone() {
             Request::TerminateBoundary => {
@@ -1390,6 +1402,53 @@ mod linux {
         workload_launcher:
             openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
         qualification: crate::RuntimeQualification,
+        /// Present only with the opt-in `supervisor-recovery.v1` extension.
+        recovery: Option<SupervisorRecovery>,
+    }
+
+    /// Runtime-held authority for fenced supervisor replacement.
+    struct SupervisorRecovery {
+        ownership: Mutex<crate::recovery_ownership::RecoveryOwnership>,
+        /// The TLS server key, retained in this nondumpable process to sign
+        /// fencing receipts the gateway verifies with the matching public key.
+        receipt_key_pem: String,
+    }
+
+    /// Lease TTL bounds: renewals must be possible, and a lapsed lease must
+    /// leave time for a replacement inside the reconnect window.
+    const MIN_RECOVERY_LEASE_TTL: Duration = Duration::from_secs(3);
+    const MAX_RECOVERY_LEASE_TTL: Duration = Duration::from_secs(20);
+    const LEASE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
+
+    fn supervisor_recovery(config: &BoundaryConfig) -> Result<Option<SupervisorRecovery>, String> {
+        let Some(recovery) = &config.supervisor_recovery else {
+            return Ok(None);
+        };
+        if recovery.protocol != openshell_core::jwt::SUPERVISOR_RECOVERY_PROTOCOL {
+            return Err(format!(
+                "unsupported supervisor recovery protocol {:?}",
+                recovery.protocol
+            ));
+        }
+        let lease_ttl = Duration::from_millis(recovery.lease_ttl_ms);
+        if !(MIN_RECOVERY_LEASE_TTL..=MAX_RECOVERY_LEASE_TTL).contains(&lease_ttl) {
+            return Err(format!(
+                "supervisor recovery lease must be between {}s and {}s",
+                MIN_RECOVERY_LEASE_TTL.as_secs(),
+                MAX_RECOVERY_LEASE_TTL.as_secs()
+            ));
+        }
+        let tls = match &config.listener {
+            BoundaryListenerConfig::Unix { tls, .. }
+            | BoundaryListenerConfig::TlsTcp { tls, .. }
+            | BoundaryListenerConfig::Vsock { tls, .. } => tls,
+        };
+        let receipt_key_pem = std::fs::read_to_string(&tls.private_key_path)
+            .map_err(|error| format!("read supervisor recovery receipt key: {error}"))?;
+        Ok(Some(SupervisorRecovery {
+            ownership: Mutex::new(crate::recovery_ownership::RecoveryOwnership::new(lease_ttl)),
+            receipt_key_pem,
+        }))
     }
 
     #[derive(Clone)]
@@ -1657,7 +1716,9 @@ mod linux {
                 Arc::new(SystemJwtClock),
             )
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
+            let recovery = supervisor_recovery(&config)?;
             Ok(Self {
+                recovery,
                 authenticator: SandboxProtocolAuthenticator::new(
                     verifier,
                     sandbox_id,
@@ -1744,10 +1805,23 @@ mod linux {
             principal: &SandboxProtocolPrincipal,
             request: &Request,
         ) -> Result<(), String> {
-            if matches!(request, Request::Attach { .. } | Request::DiscoverPolicy) {
+            if matches!(
+                request,
+                Request::Attach { .. }
+                    | Request::DiscoverPolicy
+                    | Request::RecoveryHello
+                    | Request::Recover { .. }
+            ) {
                 return Ok(());
             }
-            if matches!(request, Request::Confirm) {
+            if matches!(request, Request::Confirm)
+                && let Some(recovery) = &self.recovery
+            {
+                lock(&recovery.ownership)
+                    .confirm_allowed()
+                    .map_err(|error| error.to_string())?;
+            }
+            if matches!(request, Request::Confirm | Request::ConfirmRecovery { .. }) {
                 self.connections
                     .require_attached(principal)
                     .map_err(|error| error.to_string())
@@ -1816,6 +1890,9 @@ mod linux {
                 }
                 *connection = SupervisorConnectionState::Connected(principal.connection_id());
             }
+            if let Some(recovery) = &self.recovery {
+                lock(&recovery.ownership).start_lease_if_unset(std::time::Instant::now());
+            }
             if let Some(replaced) = replaced {
                 self.close_connection(replaced);
             }
@@ -1835,6 +1912,356 @@ mod linux {
             if let Some(shutdown) = shutdown {
                 let _ = shutdown.send(());
             }
+        }
+
+        /// Handle one `supervisor-recovery.v1` request. Runtimes launched
+        /// without the extension reject every recovery operation.
+        fn handle_supervisor_recovery(
+            self: &Arc<Self>,
+            principal: &SandboxProtocolPrincipal,
+            request: Request,
+        ) -> Response {
+            let Some(recovery) = &self.recovery else {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "supervisor recovery extension is not enabled for this runtime",
+                );
+            };
+            match request {
+                Request::RecoveryHello => {
+                    let challenge =
+                        lock(&recovery.ownership).issue_challenge(std::time::Instant::now());
+                    Response::RecoveryChallenge {
+                        protocol: openshell_core::jwt::SUPERVISOR_RECOVERY_PROTOCOL.to_string(),
+                        challenge,
+                        ownership_epoch: lock(&recovery.ownership).epoch(),
+                        generation: self.config.generation.clone(),
+                    }
+                }
+                Request::Recover { grant, proof } => {
+                    self.recover(recovery, principal, &grant, &proof)
+                }
+                Request::ConfirmRecovery { activation } => {
+                    self.confirm_recovery(recovery, principal, &activation)
+                }
+                Request::RenewLease { lease } => self.renew_lease(recovery, &lease),
+                Request::StoreRecoveryState { state } => {
+                    let stored = lock(&recovery.ownership).store_state(state);
+                    match stored {
+                        Ok(revision) => Response::RecoveryStateStored { revision },
+                        Err(error) => guest_error(BoundaryErrorKind::Denied, error.to_string()),
+                    }
+                }
+                _ => guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "request is not a supervisor recovery operation",
+                ),
+            }
+        }
+
+        fn current_process(&self) -> Option<Arc<ManagedProcess>> {
+            match &*lock(&self.state) {
+                RuntimeState::Running(process) => Some(process.clone()),
+                RuntimeState::AwaitingAttach | RuntimeState::Bound(_) | RuntimeState::Ready(_) => {
+                    None
+                }
+            }
+        }
+
+        /// Fence the previous owner for a candidate holding gateway-signed
+        /// recovery authority. The workload stays frozen until activation.
+        fn recover(
+            self: &Arc<Self>,
+            recovery: &SupervisorRecovery,
+            principal: &SandboxProtocolPrincipal,
+            grant: &str,
+            proof: &str,
+        ) -> Response {
+            let verified = match self.authenticator.verify_supervisor_authority(
+                grant,
+                openshell_core::jwt::SupervisorAuthorityKind::RecoveryGrant,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => return guest_error(BoundaryErrorKind::Denied, error.to_string()),
+            };
+            let candidate: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId =
+                match verified.authority.supervisor_instance.parse() {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        return guest_error(BoundaryErrorKind::Denied, format!("{error}"));
+                    }
+                };
+            let process = self.current_process();
+            let (fenced, closed, started_window) = {
+                // Lock order: connection state, then ownership. Termination
+                // takes the connection lock first, so delete/stop wins.
+                let mut connection = lock(&self.supervisor_connection);
+                if matches!(
+                    *connection,
+                    SupervisorConnectionState::Terminating | SupervisorConnectionState::Terminal
+                ) {
+                    return guest_error(
+                        BoundaryErrorKind::Terminated,
+                        "sandbox session is terminating; recovery is not allowed",
+                    );
+                }
+                let mut ownership = lock(&recovery.ownership);
+                let fenced =
+                    match ownership.begin_recovery(&verified, proof, std::time::Instant::now()) {
+                        Ok(fenced) => fenced,
+                        Err(error) => {
+                            return guest_error(BoundaryErrorKind::Denied, error.to_string());
+                        }
+                    };
+                let closed = match self
+                    .connections
+                    .fence_for_recovery(candidate, principal.connection_id())
+                {
+                    Ok(closed) => closed,
+                    Err(error) => {
+                        return guest_error(BoundaryErrorKind::Terminated, error.to_string());
+                    }
+                };
+                // A live previous owner (partition) is frozen now and gets a
+                // fresh bounded window. An already frozen workload keeps its
+                // original deadline: a candidate never extends it.
+                let started_window = match *connection {
+                    SupervisorConnectionState::Frozen { .. } => None,
+                    SupervisorConnectionState::AwaitingConfirmation
+                    | SupervisorConnectionState::Connected(_) => {
+                        if let Some(process) = &process {
+                            self.network_broker.set_workload_frozen(true);
+                            let _ = process.boundary_runtime.freeze();
+                        }
+                        let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
+                        *connection = SupervisorConnectionState::Frozen { recovery_id };
+                        Some(recovery_id)
+                    }
+                    SupervisorConnectionState::Terminating
+                    | SupervisorConnectionState::Terminal => unreachable!("checked above"),
+                };
+                (fenced, closed, started_window)
+            };
+            for connection_id in closed {
+                self.close_connection(connection_id);
+            }
+            if let Some(recovery_id) = started_window {
+                self.spawn_recovery_deadline(recovery_id);
+            }
+            let main_process_id = process.as_ref().map(|process| process.process_id());
+            let receipt = openshell_core::jwt::RecoveryReceipt {
+                protocol: openshell_core::jwt::SUPERVISOR_RECOVERY_PROTOCOL.to_string(),
+                sandbox_id: self.config.boundary_id.clone(),
+                runtime_generation: self.config.generation.clone(),
+                ownership_epoch: fenced.epoch,
+                supervisor_instance: fenced.supervisor_instance.clone(),
+                challenge: fenced.challenge.clone(),
+                grant_id: fenced.grant_id.clone(),
+                fenced_previous_epoch: fenced.previous_epoch,
+                main_process_id: main_process_id.clone(),
+                issued_at_unix_ms: unix_time_millis().unwrap_or(0),
+            };
+            let signed = match openshell_core::jwt::sign_ed25519_document(
+                recovery.receipt_key_pem.as_bytes(),
+                openshell_core::jwt::RECOVERY_RECEIPT_JWT_TYPE,
+                &receipt,
+            ) {
+                Ok(signed) => signed,
+                Err(error) => {
+                    // Ownership already advanced; failing closed leaves the
+                    // workload frozen until the bounded window terminates it.
+                    return guest_error(
+                        BoundaryErrorKind::Process,
+                        format!("sign recovery receipt: {error}"),
+                    );
+                }
+            };
+            let state = {
+                let mut ownership = lock(&recovery.ownership);
+                if let Err(error) =
+                    ownership.bind_receipt(openshell_core::jwt::recovery_receipt_digest(&signed))
+                {
+                    return guest_error(BoundaryErrorKind::Process, error.to_string());
+                }
+                ownership.state().cloned()
+            };
+            tracing::warn!(
+                previous_epoch = fenced.previous_epoch,
+                ownership_epoch = fenced.epoch,
+                "Supervisor ownership fenced for recovery; workload frozen pending activation"
+            );
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(openshell_ocsf::FindingInfo::new(
+                        "sandbox-supervisor-ownership-fenced",
+                        "Sandbox Supervisor Ownership Fenced",
+                    ))
+                    .message(format!(
+                        "Supervisor ownership fenced [previous_epoch:{} epoch:{}]",
+                        fenced.previous_epoch, fenced.epoch
+                    ))
+                    .build()
+            );
+            let provider_env_generation = process
+                .as_ref()
+                .map_or(0, |process| *lock(&process.provider_environment_generation));
+            Response::Recovered {
+                receipt: signed,
+                snapshot: self.session_snapshot(),
+                attached_policy: lock(&self.attached_policy).clone().map(Box::new),
+                main_process_id,
+                provider_env_generation,
+                state,
+            }
+        }
+
+        /// Resume a recovered workload once the gateway activated the exact
+        /// receipt this runtime signed.
+        fn confirm_recovery(
+            &self,
+            recovery: &SupervisorRecovery,
+            principal: &SandboxProtocolPrincipal,
+            activation: &str,
+        ) -> Response {
+            let verified = match self.authenticator.verify_supervisor_authority(
+                activation,
+                openshell_core::jwt::SupervisorAuthorityKind::Activation,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => return guest_error(BoundaryErrorKind::Denied, error.to_string()),
+            };
+            if self
+                .connections
+                .supervisor_instance()
+                .map(|instance| instance.to_string())
+                .as_deref()
+                != Some(verified.authority.supervisor_instance.as_str())
+            {
+                return guest_error(
+                    BoundaryErrorKind::Denied,
+                    "activation names a different supervisor instance",
+                );
+            }
+            let checked = lock(&recovery.ownership).check_activation(&verified);
+            if let Err(error) = checked {
+                return guest_error(BoundaryErrorKind::Denied, error.to_string());
+            }
+            let response = self.confirm();
+            if !matches!(response, Response::Confirmed { .. }) {
+                return response;
+            }
+            if let Err((kind, message)) = self.commit_confirm(principal) {
+                return guest_error(kind, message);
+            }
+            lock(&recovery.ownership).complete_activation(std::time::Instant::now());
+            tracing::info!(
+                ownership_epoch = verified.authority.ownership_epoch,
+                "Supervisor recovery activated; workload resumed"
+            );
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .state(openshell_ocsf::StateId::Enabled, "recovered")
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .message(format!(
+                        "Supervisor recovery activated [epoch:{}]",
+                        verified.authority.ownership_epoch
+                    ))
+                    .build()
+            );
+            response
+        }
+
+        fn renew_lease(&self, recovery: &SupervisorRecovery, lease: &str) -> Response {
+            let verified = match self.authenticator.verify_supervisor_authority(
+                lease,
+                openshell_core::jwt::SupervisorAuthorityKind::Lease,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => return guest_error(BoundaryErrorKind::Denied, error.to_string()),
+            };
+            let Some(owner) = self.connections.supervisor_instance() else {
+                return guest_error(BoundaryErrorKind::Denied, "runtime has no supervisor owner");
+            };
+            let now_unix = i64::try_from(unix_time_millis().unwrap_or(0) / 1000).unwrap_or(0);
+            let remaining = Duration::from_secs(
+                u64::try_from(verified.expires_at.saturating_sub(now_unix)).unwrap_or(0),
+            );
+            let renewed = lock(&recovery.ownership).renew_lease(
+                &verified,
+                &owner.to_string(),
+                remaining,
+                std::time::Instant::now(),
+            );
+            match renewed {
+                Ok(extension) => Response::LeaseRenewed {
+                    expires_in_ms: u64::try_from(extension.as_millis()).unwrap_or(u64::MAX),
+                },
+                Err(error) => guest_error(BoundaryErrorKind::Denied, error.to_string()),
+            }
+        }
+
+        fn spawn_recovery_deadline(self: &Arc<Self>, recovery_id: u64) {
+            let runtime = Arc::downgrade(self);
+            self.process_runtime.spawn(async move {
+                tokio::time::sleep(AUTHENTICATED_RECONNECT_TIMEOUT).await;
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime.expire_recovery(recovery_id).await;
+                }
+            });
+        }
+
+        /// Freeze the workload when the active owner's enforced lease lapses.
+        /// This fences a partitioned owner even if it keeps its socket open.
+        fn start_lease_watchdog(self: &Arc<Self>) {
+            if self.recovery.is_none() {
+                return;
+            }
+            let runtime = Arc::downgrade(self);
+            self.process_runtime.spawn(async move {
+                let mut interval = tokio::time::interval(LEASE_WATCHDOG_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    let Some(runtime) = runtime.upgrade() else {
+                        return;
+                    };
+                    runtime.enforce_lease(std::time::Instant::now());
+                }
+            });
+        }
+
+        fn enforce_lease(self: &Arc<Self>, now: std::time::Instant) {
+            let Some(recovery) = &self.recovery else {
+                return;
+            };
+            let SupervisorConnectionState::Connected(active) = *lock(&self.supervisor_connection)
+            else {
+                return;
+            };
+            if !lock(&recovery.ownership).lease_expired(now) {
+                return;
+            }
+            tracing::error!(
+                "Supervisor enforcement lease expired; fencing owner and freezing workload"
+            );
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(openshell_ocsf::FindingInfo::new(
+                        "sandbox-supervisor-lease-expired",
+                        "Sandbox Supervisor Lease Expired",
+                    ))
+                    .message("Supervisor enforcement lease expired; workload frozen")
+                    .build()
+            );
+            self.transport_disconnected(active);
         }
 
         fn transport_disconnected(self: &Arc<Self>, connection_id: SandboxConnectionId) {
@@ -1869,6 +2296,9 @@ mod linux {
                     let _ = process.boundary_runtime.freeze();
                 }
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
+                if let Some(recovery) = &self.recovery {
+                    lock(&recovery.ownership).suspend_lease();
+                }
             }
             tracing::warn!(
                 recovery_id,
@@ -1887,13 +2317,7 @@ mod linux {
                     .message("Sandbox Protocol connection lost; workload frozen")
                     .build()
             );
-            let runtime = Arc::downgrade(self);
-            self.process_runtime.spawn(async move {
-                tokio::time::sleep(AUTHENTICATED_RECONNECT_TIMEOUT).await;
-                if let Some(runtime) = runtime.upgrade() {
-                    runtime.expire_recovery(recovery_id).await;
-                }
-            });
+            self.spawn_recovery_deadline(recovery_id);
         }
 
         async fn expire_recovery(&self, recovery_id: u64) {
@@ -2110,6 +2534,14 @@ mod linux {
                 | Request::AcceptNetwork => guest_error(
                     BoundaryErrorKind::Invalid,
                     "streaming request used on control path",
+                ),
+                Request::RecoveryHello
+                | Request::Recover { .. }
+                | Request::ConfirmRecovery { .. }
+                | Request::RenewLease { .. }
+                | Request::StoreRecoveryState { .. } => guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "supervisor recovery request used on the replayable control path",
                 ),
             };
             if let Some(ledger) = replay_ledger.as_mut() {
@@ -4098,6 +4530,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
+                supervisor_recovery: None,
             };
             let debug = format!("{config:?}");
             assert!(debug.contains("test-key"));
@@ -4212,6 +4645,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
+                supervisor_recovery: None,
             };
             assert!(allows_runtime_supplementary_groups(&config));
         }
@@ -4283,6 +4717,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
+                        supervisor_recovery: None,
                     },
                     tokio::runtime::Handle::current(),
                     broker,
@@ -4878,6 +5313,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
+                supervisor_recovery: None,
             };
 
             validate_config(&config).unwrap();
@@ -5100,6 +5536,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
+                supervisor_recovery: None,
             };
             for address in [
                 "127.0.0.1:5500",
@@ -5147,6 +5584,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 outer_fence: test_outer_fence(),
                 child_env: std::collections::HashMap::new(),
+                supervisor_recovery: None,
             };
 
             validate_config(&config).expect("valid runtime claim configuration");
@@ -5187,6 +5625,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
+                        supervisor_recovery: None,
                     },
                     tokio::runtime::Handle::current(),
                     network_broker,
@@ -5490,6 +5929,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
+                        supervisor_recovery: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -5825,6 +6265,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         outer_fence: test_outer_fence(),
                         child_env: std::collections::HashMap::new(),
+                        supervisor_recovery: None,
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -6143,6 +6584,570 @@ mod linux {
             assert!(matches!(
                 process_runtime.block_on(session.process.wait()),
                 Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(0))
+            ));
+        }
+
+        struct RecoveryFixture {
+            runtime: Arc<BoundaryRuntime>,
+            issuer: SessionJwtIssuer,
+            token: String,
+            receipt_public_key_pem: String,
+            _directory: tempfile::TempDir,
+        }
+
+        fn recovery_fixture(
+            handle: tokio::runtime::Handle,
+            boundary_id: &str,
+            lease_ttl: Duration,
+        ) -> RecoveryFixture {
+            let directory = tempfile::tempdir().expect("recovery test directory");
+            let material =
+                generate_sandbox_tls_material(test_session_id()).expect("generate test TLS");
+            let key_path = directory.path().join("sandbox.key");
+            std::fs::write(&key_path, &material.private_key_pem).expect("write test TLS key");
+            let gateway_key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
+            let issuer = SessionJwtIssuer::from_ed25519_pem(
+                gateway_key.serialize_pem().as_bytes(),
+                "test-key",
+                "test-gateway",
+                Some(DEFAULT_SESSION_TOKEN_TTL),
+                Arc::new(SystemJwtClock),
+            )
+            .expect("test session issuer");
+            let token = issuer
+                .mint_pair(&SandboxRuntimeIdentity {
+                    sandbox_id: SandboxId::parse(boundary_id).expect("test sandbox ID"),
+                    runtime_generation:
+                        openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                            "generation-1",
+                        )
+                        .expect("runtime generation"),
+                    auth_epoch: CredentialEpoch::new(1).expect("test auth epoch"),
+                })
+                .expect("test token pair")
+                .sandbox
+                .token
+                .expose_secret()
+                .to_string();
+            let (broker, launcher) = test_network_broker();
+            let runtime = Arc::new(
+                BoundaryRuntime::new(
+                    BoundaryConfig {
+                        boundary_id: boundary_id.to_string(),
+                        generation: "generation-1".to_string(),
+                        session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
+                        auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                        gateway_id: "test-gateway".to_string(),
+                        verification_keys: vec![GatewayVerificationKey {
+                            key_id: "test-key".to_string(),
+                            public_key_pem: gateway_key.public_key_pem(),
+                        }],
+                        listener: BoundaryListenerConfig::TlsTcp {
+                            address: "127.0.0.1:5500".parse().unwrap(),
+                            tls: SandboxTlsServerConfig {
+                                certificate_chain_path: directory.path().join("sandbox.crt"),
+                                private_key_path: key_path,
+                            },
+                        },
+                        resource_claims: std::collections::BTreeMap::new(),
+                        resource_claim_files: std::collections::BTreeMap::new(),
+                        workload_identity: test_workload_identity(),
+                        outer_fence: test_outer_fence(),
+                        child_env: std::collections::HashMap::new(),
+                        supervisor_recovery: Some(
+                            openshell_sandbox_backend::boundary_protocol::SupervisorRecoveryConfig {
+                                protocol: openshell_core::jwt::SUPERVISOR_RECOVERY_PROTOCOL
+                                    .to_string(),
+                                lease_ttl_ms: u64::try_from(lease_ttl.as_millis()).unwrap(),
+                            },
+                        ),
+                    },
+                    handle,
+                    broker,
+                    launcher,
+                    test_runtime_qualification(),
+                )
+                .expect("recovery test runtime"),
+            );
+            RecoveryFixture {
+                runtime,
+                issuer,
+                token,
+                receipt_public_key_pem: material.server_public_key_pem,
+                _directory: directory,
+            }
+        }
+
+        struct Candidate {
+            instance: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
+            key: KeyPair,
+        }
+
+        impl Candidate {
+            fn new() -> Self {
+                Self {
+                    instance: test_supervisor_instance_id(),
+                    key: KeyPair::generate_for(&PKCS_ED25519).expect("candidate key"),
+                }
+            }
+        }
+
+        impl RecoveryFixture {
+            fn principal(&self) -> SandboxProtocolPrincipal {
+                self.runtime
+                    .authenticate_request(
+                        SandboxConnectionId::new(),
+                        bearer_request((), &self.token).metadata(),
+                    )
+                    .expect("principal")
+            }
+
+            fn authority(
+                &self,
+                kind: openshell_core::jwt::SupervisorAuthorityKind,
+                epoch: u64,
+                instance: &str,
+                candidate_key_pem: Option<String>,
+                challenge: Option<String>,
+                receipt_digest: Option<String>,
+            ) -> openshell_core::jwt::MintedSupervisorAuthority {
+                self.issuer
+                    .mint_supervisor_authority(
+                        &openshell_core::jwt::SupervisorAuthority {
+                            kind,
+                            sandbox_id: SandboxId::parse(self.runtime.config.boundary_id.clone())
+                                .unwrap(),
+                            runtime_generation:
+                                openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                                    "generation-1",
+                                )
+                                .unwrap(),
+                            ownership_epoch: epoch,
+                            supervisor_instance: instance.to_string(),
+                            candidate_key_pem,
+                            challenge,
+                            receipt_digest,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .expect("mint supervisor authority")
+            }
+
+            /// Run hello + grant + proof + recover for one candidate.
+            fn recover(
+                &self,
+                principal: &SandboxProtocolPrincipal,
+                candidate: &Candidate,
+                epoch: u64,
+            ) -> Response {
+                let Response::RecoveryChallenge { challenge, .. } = self
+                    .runtime
+                    .handle_supervisor_recovery(principal, Request::RecoveryHello)
+                else {
+                    panic!("expected recovery challenge");
+                };
+                self.recover_with_challenge(principal, candidate, epoch, &challenge)
+            }
+
+            fn recover_with_challenge(
+                &self,
+                principal: &SandboxProtocolPrincipal,
+                candidate: &Candidate,
+                epoch: u64,
+                challenge: &str,
+            ) -> Response {
+                let grant = self.authority(
+                    openshell_core::jwt::SupervisorAuthorityKind::RecoveryGrant,
+                    epoch,
+                    &candidate.instance.to_string(),
+                    Some(candidate.key.public_key_pem()),
+                    Some(challenge.to_string()),
+                    None,
+                );
+                let proof = openshell_core::jwt::sign_ed25519_document(
+                    candidate.key.serialize_pem().as_bytes(),
+                    openshell_core::jwt::RECOVERY_PROOF_JWT_TYPE,
+                    &openshell_core::jwt::RecoveryKeyProof {
+                        challenge: challenge.to_string(),
+                        grant_id: grant.token_id.to_string(),
+                        supervisor_instance: candidate.instance.to_string(),
+                    },
+                )
+                .expect("sign key proof");
+                self.runtime.handle_supervisor_recovery(
+                    principal,
+                    Request::Recover {
+                        grant: grant.token.expose_secret().to_string(),
+                        proof,
+                    },
+                )
+            }
+        }
+
+        fn denied(response: &Response) -> bool {
+            matches!(response, Response::Error { kind, .. } if *kind == BoundaryErrorKind::Denied)
+        }
+
+        #[test]
+        fn supervisor_recovery_preserves_the_running_workload_across_a_fenced_takeover() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_SUPERVISOR_RECOVERY_CHILD";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                let status = std::process::Command::new(
+                    std::env::current_exe().expect("current test executable"),
+                )
+                .args([
+                    "--exact",
+                    "boundary_server::linux::tests::supervisor_recovery_preserves_the_running_workload_across_a_fenced_takeover",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .status()
+                .expect("run isolated supervisor recovery test");
+                assert!(status.success(), "isolated supervisor recovery test failed");
+                return;
+            }
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let fixture = recovery_fixture(
+                process_runtime.handle().clone(),
+                "sandbox-recovery",
+                Duration::from_secs(3),
+            );
+            let runtime = &fixture.runtime;
+            let policy = SandboxPolicyWire::from(openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy::default(),
+            });
+
+            // Launch owner (epoch 1) attaches, confirms, and starts the agent.
+            let owner_instance = test_supervisor_instance_id();
+            let owner = fixture.principal();
+            assert!(matches!(
+                runtime.attach(policy.clone()),
+                Response::Attached { .. }
+            ));
+            runtime
+                .commit_attach(&owner, owner_instance)
+                .expect("attach owner");
+            assert!(matches!(runtime.confirm(), Response::Confirmed { .. }));
+            runtime.commit_confirm(&owner).expect("confirm owner");
+            let Response::Started { process_id, .. } = runtime.start_agent(
+                "sandbox-recovery".to_string(),
+                AgentSpecWire {
+                    program: "/bin/sleep".to_string(),
+                    args: vec!["60".to_string()],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                },
+                policy.clone(),
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("start agent");
+            };
+            let process = runtime.current_process().expect("running process");
+            assert!(process.boundary_runtime.is_active());
+
+            // The owner checkpoints TOFU pins for its successor.
+            let mut pins = std::collections::BTreeMap::new();
+            pins.insert("/usr/bin/curl".to_string(), "ab".repeat(32));
+            assert_eq!(
+                runtime.handle_supervisor_recovery(
+                    &owner,
+                    Request::StoreRecoveryState {
+                        state: openshell_sandbox_backend::boundary_protocol::SupervisorRecoveryStateWire {
+                            revision: 1,
+                            binary_pins: pins.clone(),
+                            policy_version: 1,
+                        },
+                    },
+                ),
+                Response::RecoveryStateStored { revision: 1 }
+            );
+
+            // The owner crashes: the workload freezes.
+            runtime.transport_disconnected(owner.connection_id());
+            assert!(
+                !process.boundary_runtime.is_active(),
+                "workload must freeze"
+            );
+
+            // A candidate fences the old owner with fresh gateway authority.
+            let candidate = Candidate::new();
+            let candidate_principal = fixture.principal();
+            let Response::Recovered {
+                receipt,
+                main_process_id,
+                attached_policy,
+                state,
+                ..
+            } = fixture.recover(&candidate_principal, &candidate, 2)
+            else {
+                panic!("expected recovered");
+            };
+            assert_eq!(main_process_id.as_deref(), Some(process_id.as_str()));
+            assert_eq!(attached_policy.as_deref(), Some(&policy));
+            assert_eq!(state.expect("recovery state").binary_pins, pins);
+            let signed: openshell_core::jwt::RecoveryReceipt =
+                openshell_core::jwt::verify_ed25519_document(
+                    fixture.receipt_public_key_pem.as_bytes(),
+                    openshell_core::jwt::RECOVERY_RECEIPT_JWT_TYPE,
+                    &receipt,
+                )
+                .expect("runtime receipt verifies with the TLS public key");
+            assert_eq!(signed.ownership_epoch, 2);
+            assert_eq!(signed.fenced_previous_epoch, 1);
+            assert!(
+                !process.boundary_runtime.is_active(),
+                "still frozen until activation"
+            );
+
+            // The returning stale owner is fenced even with valid launch credentials.
+            let returning = fixture.principal();
+            assert!(runtime.commit_attach(&returning, owner_instance).is_err());
+
+            // Activation is required; plain confirm and mismatched activation fail.
+            runtime
+                .commit_attach(&candidate_principal, candidate.instance)
+                .expect("candidate attach");
+            assert!(
+                runtime
+                    .authorize_request(&candidate_principal, &Request::Confirm)
+                    .is_err()
+            );
+            let wrong = fixture.authority(
+                openshell_core::jwt::SupervisorAuthorityKind::Activation,
+                2,
+                &candidate.instance.to_string(),
+                None,
+                None,
+                Some(openshell_core::jwt::recovery_receipt_digest(
+                    "another receipt",
+                )),
+            );
+            assert!(denied(&runtime.handle_supervisor_recovery(
+                &candidate_principal,
+                Request::ConfirmRecovery {
+                    activation: wrong.token.expose_secret().to_string(),
+                },
+            )));
+            let activation = fixture.authority(
+                openshell_core::jwt::SupervisorAuthorityKind::Activation,
+                2,
+                &candidate.instance.to_string(),
+                None,
+                None,
+                Some(openshell_core::jwt::recovery_receipt_digest(&receipt)),
+            );
+            assert!(matches!(
+                runtime.handle_supervisor_recovery(
+                    &candidate_principal,
+                    Request::ConfirmRecovery {
+                        activation: activation.token.expose_secret().to_string(),
+                    },
+                ),
+                Response::Confirmed { .. }
+            ));
+
+            // The same workload process resumes; it was never restarted.
+            assert!(process.boundary_runtime.is_active(), "workload must resume");
+            assert!(process.exit_status().is_none());
+            assert_eq!(
+                runtime
+                    .current_process()
+                    .map(|process| process.process_id()),
+                Some(process_id)
+            );
+
+            // Leases bind the new epoch and instance.
+            let old_lease = fixture.authority(
+                openshell_core::jwt::SupervisorAuthorityKind::Lease,
+                1,
+                &owner_instance.to_string(),
+                None,
+                None,
+                None,
+            );
+            assert!(denied(&runtime.handle_supervisor_recovery(
+                &candidate_principal,
+                Request::RenewLease {
+                    lease: old_lease.token.expose_secret().to_string(),
+                },
+            )));
+            let lease = fixture.authority(
+                openshell_core::jwt::SupervisorAuthorityKind::Lease,
+                2,
+                &candidate.instance.to_string(),
+                None,
+                None,
+                None,
+            );
+            assert!(matches!(
+                runtime.handle_supervisor_recovery(
+                    &candidate_principal,
+                    Request::RenewLease {
+                        lease: lease.token.expose_secret().to_string(),
+                    },
+                ),
+                Response::LeaseRenewed { .. }
+            ));
+
+            // A partitioned owner that stops renewing is fenced by the runtime.
+            runtime.enforce_lease(std::time::Instant::now() + Duration::from_secs(10));
+            assert!(matches!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Frozen { .. }
+            ));
+            assert!(!process.boundary_runtime.is_active());
+
+            assert_eq!(
+                process_runtime.block_on(runtime.terminate_boundary()),
+                Response::BoundaryTerminated
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn concurrent_recovery_candidates_cannot_both_take_ownership() {
+            let fixture = recovery_fixture(
+                tokio::runtime::Handle::current(),
+                "sandbox-race",
+                Duration::from_secs(3),
+            );
+            let runtime = &fixture.runtime;
+            let owner = fixture.principal();
+            runtime
+                .commit_attach(&owner, test_supervisor_instance_id())
+                .expect("attach owner");
+            runtime.commit_confirm(&owner).expect("confirm owner");
+            runtime.transport_disconnected(owner.connection_id());
+
+            let first = Candidate::new();
+            let second = Candidate::new();
+            let first_principal = fixture.principal();
+            let second_principal = fixture.principal();
+            let Response::RecoveryChallenge {
+                challenge: first_challenge,
+                ..
+            } = runtime.handle_supervisor_recovery(&first_principal, Request::RecoveryHello)
+            else {
+                panic!("first challenge");
+            };
+            let Response::RecoveryChallenge {
+                challenge: second_challenge,
+                ..
+            } = runtime.handle_supervisor_recovery(&second_principal, Request::RecoveryHello)
+            else {
+                panic!("second challenge");
+            };
+            assert!(matches!(
+                fixture.recover_with_challenge(&first_principal, &first, 2, &first_challenge),
+                Response::Recovered { .. }
+            ));
+            // Even a valid grant for the same epoch cannot take ownership twice.
+            assert!(denied(&fixture.recover_with_challenge(
+                &second_principal,
+                &second,
+                2,
+                &second_challenge,
+            )));
+            // A higher epoch fences the first candidate in turn.
+            assert!(matches!(
+                fixture.recover(&second_principal, &second, 3),
+                Response::Recovered { .. }
+            ));
+            assert!(
+                runtime
+                    .commit_attach(&first_principal, first.instance)
+                    .is_err()
+            );
+            runtime
+                .commit_attach(&second_principal, second.instance)
+                .expect("second candidate attaches");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn delete_wins_over_pending_supervisor_recovery() {
+            let fixture = recovery_fixture(
+                tokio::runtime::Handle::current(),
+                "sandbox-delete",
+                Duration::from_secs(3),
+            );
+            let runtime = &fixture.runtime;
+            let owner = fixture.principal();
+            runtime
+                .commit_attach(&owner, test_supervisor_instance_id())
+                .expect("attach owner");
+            runtime.commit_confirm(&owner).expect("confirm owner");
+            runtime.transport_disconnected(owner.connection_id());
+
+            let candidate = Candidate::new();
+            let principal = fixture.principal();
+            let Response::Recovered { receipt, .. } = fixture.recover(&principal, &candidate, 2)
+            else {
+                panic!("expected recovered");
+            };
+            runtime
+                .commit_attach(&principal, candidate.instance)
+                .expect("candidate attach");
+
+            // Stop/delete arrives while recovery is prepared.
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+
+            let activation = fixture.authority(
+                openshell_core::jwt::SupervisorAuthorityKind::Activation,
+                2,
+                &candidate.instance.to_string(),
+                None,
+                None,
+                Some(openshell_core::jwt::recovery_receipt_digest(&receipt)),
+            );
+            let response = runtime.handle_supervisor_recovery(
+                &principal,
+                Request::ConfirmRecovery {
+                    activation: activation.token.expose_secret().to_string(),
+                },
+            );
+            assert!(
+                matches!(response, Response::Error { .. }),
+                "activation after delete must fail: {response:?}"
+            );
+            let late = Candidate::new();
+            assert!(matches!(
+                fixture.recover(&fixture.principal(), &late, 3),
+                Response::Error { kind, .. } if kind == BoundaryErrorKind::Terminated
+            ));
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn dedicated_runtimes_reject_the_recovery_extension() {
+            let (runtime, token) = availability_test_runtime();
+            let principal = runtime
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &token).metadata(),
+                )
+                .expect("principal");
+            assert!(matches!(
+                runtime.handle_supervisor_recovery(&principal, Request::RecoveryHello),
+                Response::Error { kind, .. } if kind == BoundaryErrorKind::Invalid
             ));
         }
     }

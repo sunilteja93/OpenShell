@@ -965,6 +965,37 @@ network supervisor logs for CONNECT and upstream-proxy decisions:
 kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
 ```
 
+#### Gateway supervisor topology (prototype)
+
+When the rendered `gateway.toml` has `supervisor_topology = "gateway"` under
+`[openshell.gateway]`, sandboxes have no `os-supervisor-<id>` Pod. One shared
+`openshell-supervisor-pool` Deployment (two replicas, no owner reference) in
+the sandbox namespace supervises every sandbox; gateway logs record
+assignments, recovery reservations, and activations.
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep supervisor_topology
+kubectl -n <sandbox-namespace> get deployment openshell-supervisor-pool -o wide
+kubectl -n <sandbox-namespace> get pods -l openshell.ai/component=supervisor-pool -o wide
+kubectl -n <sandbox-namespace> logs <pool-pod> --tail=200 | grep -E 'hosted supervisor session|abandon|self-fenc|lease'
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell --tail=300 | grep -E 'supervisor assignment|shared supervisor|Reserved fenced|Activated supervisor recovery|Supervisor recovery failed'
+for resource in deployments replicasets; do
+  kubectl auth can-i get "$resource.apps" -n <sandbox-namespace> \
+    --as system:serviceaccount:openshell:openshell
+done
+kubectl auth can-i get secrets -n <sandbox-namespace> --as system:serviceaccount:openshell:openshell
+```
+
+Gateway startup fails if the topology is set without the in-process Kubernetes
+driver, with a non-`shared` workspace mode, or without gateway JWT signing.
+A pool Pod that cannot register usually fails TokenReview (wrong service
+account or namespace) or is not controlled by the current Deployment UID.
+After a pool Pod dies, its sandboxes freeze until another replica fences and
+resumes them (normally within about 10 to 20 seconds). A sandbox in `Error`
+with reason `SupervisorRecoveryFailed` missed the 30-second runtime recovery
+window; the runtime already stopped its workload, so start it again explicitly.
+Sandbox deletion never deletes the shared Deployment.
+
 ### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:

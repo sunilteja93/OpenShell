@@ -83,6 +83,44 @@ impl FromStr for PolicyValidationFailureMode {
     }
 }
 
+/// Where supervisors that enforce sandbox boundaries run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorTopology {
+    /// One supervisor per sandbox, created by the compute driver. Recovery is
+    /// limited to the same supervisor process.
+    #[default]
+    Dedicated,
+    /// One shared, highly available supervisor Deployment for the whole
+    /// gateway installation. A failed supervisor is replaced by fenced
+    /// takeover that resumes the running workload.
+    Gateway,
+}
+
+impl SupervisorTopology {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dedicated => "dedicated",
+            Self::Gateway => "gateway",
+        }
+    }
+}
+
+impl FromStr for SupervisorTopology {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "dedicated" => Ok(Self::Dedicated),
+            "gateway" => Ok(Self::Gateway),
+            _ => Err(format!(
+                "invalid supervisor topology '{value}'; expected dedicated or gateway"
+            )),
+        }
+    }
+}
+
 /// Default OCI repository for the supervisor image (no tag).
 pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
@@ -208,6 +246,9 @@ pub struct Config {
 
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
+
+    /// Supervisor placement for sandboxes of this gateway installation.
+    pub supervisor_topology: SupervisorTopology,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
@@ -883,6 +924,7 @@ impl Config {
             metrics_bind_address: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            supervisor_topology: SupervisorTopology::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),

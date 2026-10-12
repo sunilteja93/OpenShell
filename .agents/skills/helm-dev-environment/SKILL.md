@@ -285,6 +285,16 @@ rotate. It also keeps a long-running sandbox alive and runs upload/download
 operations while gateway pods roll, so file sync exercises the same relay retry
 path as interactive sessions.
 
+Use `mise run e2e:kubernetes:supervisor-topology` for the gateway supervisor
+topology prototype (`[openshell.gateway] supervisor_topology = "gateway"`). It
+uses `ci/values-supervisor-gateway-topology.yaml` (two gateway replicas, the
+external PostgreSQL fixture, Envoy) and runs CLI conformance plus
+`kubernetes_supervisor_topology`, which kills and pauses shared supervisor Pods
+to check fenced takeover of running agents. The partition step pauses one
+supervisor process through `crictl` inside the k3d or kind node container
+(`OPENSHELL_E2E_KUBE_NODE_CONTAINER` overrides the derived name); run it only
+against a disposable cluster.
+
 If you reuse an existing Skaffold cluster for the full kube suite, make sure the
 chart has `server.hostGatewayIP` set so sandbox pods can resolve
 `host.openshell.internal` back to the test host. The e2e wrapper detects this on

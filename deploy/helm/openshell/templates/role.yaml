@@ -1,6 +1,8 @@
 {{- $kubernetesConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
 {{- $workspaceMode := get $kubernetesConfig "workspace_mode" | default "shared" -}}
 {{- $allowDriverConfig := get $kubernetesConfig "allow_driver_config" | default false -}}
+{{- $gatewaySection := get (.Values.gatewayConfig | default dict) "openshell.gateway" | default dict -}}
+{{- $sharedSupervisorPool := eq (get $gatewaySection "supervisor_topology" | default "dedicated") "gateway" -}}
 {{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) (include "openshell.rbacCreate" .) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -67,4 +69,18 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
+  {{- if $sharedSupervisorPool }}
+  # Gateway supervisor topology: the driver reconciles one shared supervisor
+  # Deployment, verifies pool membership through its ReplicaSet, and hands
+  # each assigned replica the per-generation supervisor bootstrap Secret.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  {{- end }}
 {{- end }}

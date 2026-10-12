@@ -11,12 +11,13 @@
 use crate::procfs;
 use miette::Result;
 use openshell_isolation_interface::contract::BinaryIdentity;
+use openshell_isolation_interface::recovery_state::EnforcementPinJournal;
 use std::collections::HashMap;
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 const MAX_IDENTITY_CACHE_ENTRIES: usize = 4096;
@@ -97,7 +98,13 @@ struct CachedBinary {
 pub struct BinaryIdentityCache {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     hashes: Mutex<HashMap<PathBuf, CachedBinary>>,
+    /// Durable pin journal for supervisor recovery. Without it, pins live
+    /// only in this process, as with a dedicated supervisor.
+    journal: Option<Arc<EnforcementPinJournal>>,
 }
+
+/// A new pin must be checkpointed by the runtime before it authorizes traffic.
+const PIN_CHECKPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SuppliedIdentityError {
@@ -119,7 +126,41 @@ impl BinaryIdentityCache {
     pub fn new() -> Self {
         Self {
             hashes: Mutex::new(HashMap::new()),
+            journal: None,
         }
+    }
+
+    /// Build a cache backed by a durable pin journal. Pins restored by a
+    /// fenced recovery are authoritative from the start: a replacement never
+    /// relearns them from the running workload.
+    pub fn with_journal(journal: Arc<EnforcementPinJournal>) -> Self {
+        let hashes = journal
+            .pins()
+            .into_iter()
+            .map(|(path, hash)| {
+                (
+                    PathBuf::from(path),
+                    CachedBinary {
+                        hash,
+                        fingerprint: None,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            hashes: Mutex::new(hashes),
+            journal: Some(journal),
+        }
+    }
+
+    /// Wait until every pin learned so far is checkpointed. Returns `false`
+    /// when the checkpoint did not complete; the caller must deny.
+    pub async fn pins_durable(&self) -> bool {
+        let Some(journal) = &self.journal else {
+            return true;
+        };
+        let (revision, _) = journal.snapshot();
+        journal.wait_durable(revision, PIN_CHECKPOINT_TIMEOUT).await
     }
 
     /// Verify a binary's integrity or cache its hash on first use.
@@ -186,11 +227,21 @@ impl BinaryIdentityCache {
             return Err(SuppliedIdentityError::CapacityExhausted);
         }
 
+        let mut learned = Vec::new();
         for (path, digest) in supplied {
-            hashes.entry(path).or_insert_with(|| CachedBinary {
-                hash: digest.to_string(),
-                fingerprint: None,
+            hashes.entry(path.clone()).or_insert_with(|| {
+                learned.push((path.to_string_lossy().into_owned(), digest.to_string()));
+                CachedBinary {
+                    hash: digest.to_string(),
+                    fingerprint: None,
+                }
             });
+        }
+        drop(hashes);
+        if let Some(journal) = &self.journal
+            && !learned.is_empty()
+        {
+            journal.record(learned);
         }
         Ok(())
     }
@@ -312,6 +363,40 @@ mod tests {
                 .collect(),
             cmdline_paths: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn restored_pins_survive_supervisor_replacement() {
+        // The previous owner pinned /sandbox/tool and checkpointed it.
+        let previous = Arc::new(EnforcementPinJournal::new(std::collections::BTreeMap::new()));
+        let owner = BinaryIdentityCache::with_journal(previous.clone());
+        owner
+            .verify_or_cache_supplied_identity(&supplied_identity("/sandbox/tool", Some("11"), &[]))
+            .unwrap();
+        assert!(
+            !owner.pins_durable().await,
+            "a new pin must not authorize traffic before it is checkpointed"
+        );
+        let (revision, pins) = previous.snapshot();
+        previous.mark_durable(revision);
+        assert!(owner.pins_durable().await);
+
+        // The replacement restores the checkpoint; a binary swapped while the
+        // supervisor was down is not relearned as a first use.
+        let replacement =
+            BinaryIdentityCache::with_journal(Arc::new(EnforcementPinJournal::new(pins)));
+        let error = replacement
+            .verify_or_cache_supplied_identity(&supplied_identity("/sandbox/tool", Some("22"), &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("integrity violation"), "{error}");
+        replacement
+            .verify_or_cache_supplied_identity(&supplied_identity("/sandbox/tool", Some("11"), &[]))
+            .unwrap();
+        assert!(
+            replacement.pins_durable().await,
+            "restored pins need no new checkpoint"
+        );
     }
 
     #[test]

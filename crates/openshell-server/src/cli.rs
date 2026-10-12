@@ -574,6 +574,13 @@ fn prepare_server_config_with_drivers(
         config.policy_validation_failure_mode = mode;
     }
 
+    if let Some(topology) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.supervisor_topology)
+    {
+        config.supervisor_topology = topology;
+    }
+
     if let Some(seconds) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.image_preparation_timeout_seconds)

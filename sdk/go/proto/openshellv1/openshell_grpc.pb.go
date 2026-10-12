@@ -23,89 +23,94 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	OpenShell_Health_FullMethodName                        = "/openshell.v1.OpenShell/Health"
-	OpenShell_GetCurrentUser_FullMethodName                = "/openshell.v1.OpenShell/GetCurrentUser"
-	OpenShell_GetGatewayInfo_FullMethodName                = "/openshell.v1.OpenShell/GetGatewayInfo"
-	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
-	OpenShell_BeginRootfsTarStaging_FullMethodName         = "/openshell.v1.OpenShell/BeginRootfsTarStaging"
-	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
-	OpenShell_ListSandboxes_FullMethodName                 = "/openshell.v1.OpenShell/ListSandboxes"
-	OpenShell_CreateSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/CreateSandboxTemplate"
-	OpenShell_GetSandboxTemplate_FullMethodName            = "/openshell.v1.OpenShell/GetSandboxTemplate"
-	OpenShell_ListSandboxTemplates_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxTemplates"
-	OpenShell_DeleteSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/DeleteSandboxTemplate"
-	OpenShell_ListSandboxProviders_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxProviders"
-	OpenShell_AttachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/AttachSandboxProvider"
-	OpenShell_DetachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/DetachSandboxProvider"
-	OpenShell_GetSandboxProviderStatus_FullMethodName      = "/openshell.v1.OpenShell/GetSandboxProviderStatus"
-	OpenShell_DeleteSandbox_FullMethodName                 = "/openshell.v1.OpenShell/DeleteSandbox"
-	OpenShell_StopSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StopSandbox"
-	OpenShell_StartSandbox_FullMethodName                  = "/openshell.v1.OpenShell/StartSandbox"
-	OpenShell_CreateSshSession_FullMethodName              = "/openshell.v1.OpenShell/CreateSshSession"
-	OpenShell_ExposeService_FullMethodName                 = "/openshell.v1.OpenShell/ExposeService"
-	OpenShell_GetService_FullMethodName                    = "/openshell.v1.OpenShell/GetService"
-	OpenShell_ListServices_FullMethodName                  = "/openshell.v1.OpenShell/ListServices"
-	OpenShell_DeleteService_FullMethodName                 = "/openshell.v1.OpenShell/DeleteService"
-	OpenShell_RevokeSshSession_FullMethodName              = "/openshell.v1.OpenShell/RevokeSshSession"
-	OpenShell_ExecSandbox_FullMethodName                   = "/openshell.v1.OpenShell/ExecSandbox"
-	OpenShell_ForwardTcp_FullMethodName                    = "/openshell.v1.OpenShell/ForwardTcp"
-	OpenShell_ExecSandboxInteractive_FullMethodName        = "/openshell.v1.OpenShell/ExecSandboxInteractive"
-	OpenShell_CreateProvider_FullMethodName                = "/openshell.v1.OpenShell/CreateProvider"
-	OpenShell_GetProvider_FullMethodName                   = "/openshell.v1.OpenShell/GetProvider"
-	OpenShell_GetProviderCredentials_FullMethodName        = "/openshell.v1.OpenShell/GetProviderCredentials"
-	OpenShell_ListProviders_FullMethodName                 = "/openshell.v1.OpenShell/ListProviders"
-	OpenShell_ListProviderProfiles_FullMethodName          = "/openshell.v1.OpenShell/ListProviderProfiles"
-	OpenShell_GetProviderProfile_FullMethodName            = "/openshell.v1.OpenShell/GetProviderProfile"
-	OpenShell_ImportProviderProfiles_FullMethodName        = "/openshell.v1.OpenShell/ImportProviderProfiles"
-	OpenShell_UpdateProviderProfiles_FullMethodName        = "/openshell.v1.OpenShell/UpdateProviderProfiles"
-	OpenShell_LintProviderProfiles_FullMethodName          = "/openshell.v1.OpenShell/LintProviderProfiles"
-	OpenShell_UpdateProvider_FullMethodName                = "/openshell.v1.OpenShell/UpdateProvider"
-	OpenShell_GetProviderRefreshStatus_FullMethodName      = "/openshell.v1.OpenShell/GetProviderRefreshStatus"
-	OpenShell_ConfigureProviderRefresh_FullMethodName      = "/openshell.v1.OpenShell/ConfigureProviderRefresh"
-	OpenShell_RotateProviderCredential_FullMethodName      = "/openshell.v1.OpenShell/RotateProviderCredential"
-	OpenShell_DeleteProviderRefresh_FullMethodName         = "/openshell.v1.OpenShell/DeleteProviderRefresh"
-	OpenShell_DeleteProvider_FullMethodName                = "/openshell.v1.OpenShell/DeleteProvider"
-	OpenShell_DeleteProviderProfile_FullMethodName         = "/openshell.v1.OpenShell/DeleteProviderProfile"
-	OpenShell_GetSandboxConfig_FullMethodName              = "/openshell.v1.OpenShell/GetSandboxConfig"
-	OpenShell_GetGatewayConfig_FullMethodName              = "/openshell.v1.OpenShell/GetGatewayConfig"
-	OpenShell_UpdateConfig_FullMethodName                  = "/openshell.v1.OpenShell/UpdateConfig"
-	OpenShell_GetSandboxPolicyStatus_FullMethodName        = "/openshell.v1.OpenShell/GetSandboxPolicyStatus"
-	OpenShell_ListSandboxPolicies_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxPolicies"
-	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
-	OpenShell_ReportEndpointStatus_FullMethodName          = "/openshell.v1.OpenShell/ReportEndpointStatus"
-	OpenShell_ReportProviderReadiness_FullMethodName       = "/openshell.v1.OpenShell/ReportProviderReadiness"
-	OpenShell_ReportSandboxConfiguration_FullMethodName    = "/openshell.v1.OpenShell/ReportSandboxConfiguration"
-	OpenShell_GetSandboxProviderEnvironment_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
-	OpenShell_ExchangeProviderSubjectToken_FullMethodName  = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
-	OpenShell_GetSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/GetSandboxLogs"
-	OpenShell_PushSandboxLogs_FullMethodName               = "/openshell.v1.OpenShell/PushSandboxLogs"
-	OpenShell_ConnectSupervisor_FullMethodName             = "/openshell.v1.OpenShell/ConnectSupervisor"
-	OpenShell_ReportMainProcessExit_FullMethodName         = "/openshell.v1.OpenShell/ReportMainProcessExit"
-	OpenShell_FinalizeMainProcessExit_FullMethodName       = "/openshell.v1.OpenShell/FinalizeMainProcessExit"
-	OpenShell_RelayStream_FullMethodName                   = "/openshell.v1.OpenShell/RelayStream"
-	OpenShell_PeerRelay_FullMethodName                     = "/openshell.v1.OpenShell/PeerRelay"
-	OpenShell_PeerReportProviderReadiness_FullMethodName   = "/openshell.v1.OpenShell/PeerReportProviderReadiness"
-	OpenShell_PeerReportEndpointStatus_FullMethodName      = "/openshell.v1.OpenShell/PeerReportEndpointStatus"
-	OpenShell_PeerGetSandboxProviderStatus_FullMethodName  = "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus"
-	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
-	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
-	OpenShell_GetDraftPolicy_FullMethodName                = "/openshell.v1.OpenShell/GetDraftPolicy"
-	OpenShell_ApproveDraftChunk_FullMethodName             = "/openshell.v1.OpenShell/ApproveDraftChunk"
-	OpenShell_RejectDraftChunk_FullMethodName              = "/openshell.v1.OpenShell/RejectDraftChunk"
-	OpenShell_ApproveAllDraftChunks_FullMethodName         = "/openshell.v1.OpenShell/ApproveAllDraftChunks"
-	OpenShell_EditDraftChunk_FullMethodName                = "/openshell.v1.OpenShell/EditDraftChunk"
-	OpenShell_UndoDraftChunk_FullMethodName                = "/openshell.v1.OpenShell/UndoDraftChunk"
-	OpenShell_ClearDraftChunks_FullMethodName              = "/openshell.v1.OpenShell/ClearDraftChunks"
-	OpenShell_GetDraftHistory_FullMethodName               = "/openshell.v1.OpenShell/GetDraftHistory"
-	OpenShell_IssueSandboxToken_FullMethodName             = "/openshell.v1.OpenShell/IssueSandboxToken"
-	OpenShell_RefreshSandboxToken_FullMethodName           = "/openshell.v1.OpenShell/RefreshSandboxToken"
-	OpenShell_CreateWorkspace_FullMethodName               = "/openshell.v1.OpenShell/CreateWorkspace"
-	OpenShell_GetWorkspace_FullMethodName                  = "/openshell.v1.OpenShell/GetWorkspace"
-	OpenShell_ListWorkspaces_FullMethodName                = "/openshell.v1.OpenShell/ListWorkspaces"
-	OpenShell_DeleteWorkspace_FullMethodName               = "/openshell.v1.OpenShell/DeleteWorkspace"
-	OpenShell_AddWorkspaceMember_FullMethodName            = "/openshell.v1.OpenShell/AddWorkspaceMember"
-	OpenShell_RemoveWorkspaceMember_FullMethodName         = "/openshell.v1.OpenShell/RemoveWorkspaceMember"
-	OpenShell_ListWorkspaceMembers_FullMethodName          = "/openshell.v1.OpenShell/ListWorkspaceMembers"
+	OpenShell_Health_FullMethodName                         = "/openshell.v1.OpenShell/Health"
+	OpenShell_GetCurrentUser_FullMethodName                 = "/openshell.v1.OpenShell/GetCurrentUser"
+	OpenShell_GetGatewayInfo_FullMethodName                 = "/openshell.v1.OpenShell/GetGatewayInfo"
+	OpenShell_CreateSandbox_FullMethodName                  = "/openshell.v1.OpenShell/CreateSandbox"
+	OpenShell_BeginRootfsTarStaging_FullMethodName          = "/openshell.v1.OpenShell/BeginRootfsTarStaging"
+	OpenShell_GetSandbox_FullMethodName                     = "/openshell.v1.OpenShell/GetSandbox"
+	OpenShell_ListSandboxes_FullMethodName                  = "/openshell.v1.OpenShell/ListSandboxes"
+	OpenShell_CreateSandboxTemplate_FullMethodName          = "/openshell.v1.OpenShell/CreateSandboxTemplate"
+	OpenShell_GetSandboxTemplate_FullMethodName             = "/openshell.v1.OpenShell/GetSandboxTemplate"
+	OpenShell_ListSandboxTemplates_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxTemplates"
+	OpenShell_DeleteSandboxTemplate_FullMethodName          = "/openshell.v1.OpenShell/DeleteSandboxTemplate"
+	OpenShell_ListSandboxProviders_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxProviders"
+	OpenShell_AttachSandboxProvider_FullMethodName          = "/openshell.v1.OpenShell/AttachSandboxProvider"
+	OpenShell_DetachSandboxProvider_FullMethodName          = "/openshell.v1.OpenShell/DetachSandboxProvider"
+	OpenShell_GetSandboxProviderStatus_FullMethodName       = "/openshell.v1.OpenShell/GetSandboxProviderStatus"
+	OpenShell_DeleteSandbox_FullMethodName                  = "/openshell.v1.OpenShell/DeleteSandbox"
+	OpenShell_StopSandbox_FullMethodName                    = "/openshell.v1.OpenShell/StopSandbox"
+	OpenShell_StartSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StartSandbox"
+	OpenShell_CreateSshSession_FullMethodName               = "/openshell.v1.OpenShell/CreateSshSession"
+	OpenShell_ExposeService_FullMethodName                  = "/openshell.v1.OpenShell/ExposeService"
+	OpenShell_GetService_FullMethodName                     = "/openshell.v1.OpenShell/GetService"
+	OpenShell_ListServices_FullMethodName                   = "/openshell.v1.OpenShell/ListServices"
+	OpenShell_DeleteService_FullMethodName                  = "/openshell.v1.OpenShell/DeleteService"
+	OpenShell_RevokeSshSession_FullMethodName               = "/openshell.v1.OpenShell/RevokeSshSession"
+	OpenShell_ExecSandbox_FullMethodName                    = "/openshell.v1.OpenShell/ExecSandbox"
+	OpenShell_ForwardTcp_FullMethodName                     = "/openshell.v1.OpenShell/ForwardTcp"
+	OpenShell_ExecSandboxInteractive_FullMethodName         = "/openshell.v1.OpenShell/ExecSandboxInteractive"
+	OpenShell_CreateProvider_FullMethodName                 = "/openshell.v1.OpenShell/CreateProvider"
+	OpenShell_GetProvider_FullMethodName                    = "/openshell.v1.OpenShell/GetProvider"
+	OpenShell_GetProviderCredentials_FullMethodName         = "/openshell.v1.OpenShell/GetProviderCredentials"
+	OpenShell_ListProviders_FullMethodName                  = "/openshell.v1.OpenShell/ListProviders"
+	OpenShell_ListProviderProfiles_FullMethodName           = "/openshell.v1.OpenShell/ListProviderProfiles"
+	OpenShell_GetProviderProfile_FullMethodName             = "/openshell.v1.OpenShell/GetProviderProfile"
+	OpenShell_ImportProviderProfiles_FullMethodName         = "/openshell.v1.OpenShell/ImportProviderProfiles"
+	OpenShell_UpdateProviderProfiles_FullMethodName         = "/openshell.v1.OpenShell/UpdateProviderProfiles"
+	OpenShell_LintProviderProfiles_FullMethodName           = "/openshell.v1.OpenShell/LintProviderProfiles"
+	OpenShell_UpdateProvider_FullMethodName                 = "/openshell.v1.OpenShell/UpdateProvider"
+	OpenShell_GetProviderRefreshStatus_FullMethodName       = "/openshell.v1.OpenShell/GetProviderRefreshStatus"
+	OpenShell_ConfigureProviderRefresh_FullMethodName       = "/openshell.v1.OpenShell/ConfigureProviderRefresh"
+	OpenShell_RotateProviderCredential_FullMethodName       = "/openshell.v1.OpenShell/RotateProviderCredential"
+	OpenShell_DeleteProviderRefresh_FullMethodName          = "/openshell.v1.OpenShell/DeleteProviderRefresh"
+	OpenShell_DeleteProvider_FullMethodName                 = "/openshell.v1.OpenShell/DeleteProvider"
+	OpenShell_DeleteProviderProfile_FullMethodName          = "/openshell.v1.OpenShell/DeleteProviderProfile"
+	OpenShell_GetSandboxConfig_FullMethodName               = "/openshell.v1.OpenShell/GetSandboxConfig"
+	OpenShell_GetGatewayConfig_FullMethodName               = "/openshell.v1.OpenShell/GetGatewayConfig"
+	OpenShell_UpdateConfig_FullMethodName                   = "/openshell.v1.OpenShell/UpdateConfig"
+	OpenShell_GetSandboxPolicyStatus_FullMethodName         = "/openshell.v1.OpenShell/GetSandboxPolicyStatus"
+	OpenShell_ListSandboxPolicies_FullMethodName            = "/openshell.v1.OpenShell/ListSandboxPolicies"
+	OpenShell_ReportPolicyStatus_FullMethodName             = "/openshell.v1.OpenShell/ReportPolicyStatus"
+	OpenShell_ReportEndpointStatus_FullMethodName           = "/openshell.v1.OpenShell/ReportEndpointStatus"
+	OpenShell_ReportProviderReadiness_FullMethodName        = "/openshell.v1.OpenShell/ReportProviderReadiness"
+	OpenShell_ReportSandboxConfiguration_FullMethodName     = "/openshell.v1.OpenShell/ReportSandboxConfiguration"
+	OpenShell_GetSandboxProviderEnvironment_FullMethodName  = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
+	OpenShell_ExchangeProviderSubjectToken_FullMethodName   = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
+	OpenShell_GetSandboxLogs_FullMethodName                 = "/openshell.v1.OpenShell/GetSandboxLogs"
+	OpenShell_PushSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/PushSandboxLogs"
+	OpenShell_ConnectSupervisor_FullMethodName              = "/openshell.v1.OpenShell/ConnectSupervisor"
+	OpenShell_ReportMainProcessExit_FullMethodName          = "/openshell.v1.OpenShell/ReportMainProcessExit"
+	OpenShell_FinalizeMainProcessExit_FullMethodName        = "/openshell.v1.OpenShell/FinalizeMainProcessExit"
+	OpenShell_RelayStream_FullMethodName                    = "/openshell.v1.OpenShell/RelayStream"
+	OpenShell_PeerRelay_FullMethodName                      = "/openshell.v1.OpenShell/PeerRelay"
+	OpenShell_PeerReportProviderReadiness_FullMethodName    = "/openshell.v1.OpenShell/PeerReportProviderReadiness"
+	OpenShell_PeerReportEndpointStatus_FullMethodName       = "/openshell.v1.OpenShell/PeerReportEndpointStatus"
+	OpenShell_PeerGetSandboxProviderStatus_FullMethodName   = "/openshell.v1.OpenShell/PeerGetSandboxProviderStatus"
+	OpenShell_WatchSandbox_FullMethodName                   = "/openshell.v1.OpenShell/WatchSandbox"
+	OpenShell_SubmitPolicyAnalysis_FullMethodName           = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
+	OpenShell_GetDraftPolicy_FullMethodName                 = "/openshell.v1.OpenShell/GetDraftPolicy"
+	OpenShell_ApproveDraftChunk_FullMethodName              = "/openshell.v1.OpenShell/ApproveDraftChunk"
+	OpenShell_RejectDraftChunk_FullMethodName               = "/openshell.v1.OpenShell/RejectDraftChunk"
+	OpenShell_ApproveAllDraftChunks_FullMethodName          = "/openshell.v1.OpenShell/ApproveAllDraftChunks"
+	OpenShell_EditDraftChunk_FullMethodName                 = "/openshell.v1.OpenShell/EditDraftChunk"
+	OpenShell_UndoDraftChunk_FullMethodName                 = "/openshell.v1.OpenShell/UndoDraftChunk"
+	OpenShell_ClearDraftChunks_FullMethodName               = "/openshell.v1.OpenShell/ClearDraftChunks"
+	OpenShell_GetDraftHistory_FullMethodName                = "/openshell.v1.OpenShell/GetDraftHistory"
+	OpenShell_IssueSandboxToken_FullMethodName              = "/openshell.v1.OpenShell/IssueSandboxToken"
+	OpenShell_RefreshSandboxToken_FullMethodName            = "/openshell.v1.OpenShell/RefreshSandboxToken"
+	OpenShell_CreateWorkspace_FullMethodName                = "/openshell.v1.OpenShell/CreateWorkspace"
+	OpenShell_GetWorkspace_FullMethodName                   = "/openshell.v1.OpenShell/GetWorkspace"
+	OpenShell_ListWorkspaces_FullMethodName                 = "/openshell.v1.OpenShell/ListWorkspaces"
+	OpenShell_DeleteWorkspace_FullMethodName                = "/openshell.v1.OpenShell/DeleteWorkspace"
+	OpenShell_AddWorkspaceMember_FullMethodName             = "/openshell.v1.OpenShell/AddWorkspaceMember"
+	OpenShell_RemoveWorkspaceMember_FullMethodName          = "/openshell.v1.OpenShell/RemoveWorkspaceMember"
+	OpenShell_ListWorkspaceMembers_FullMethodName           = "/openshell.v1.OpenShell/ListWorkspaceMembers"
+	OpenShell_SyncSupervisorPool_FullMethodName             = "/openshell.v1.OpenShell/SyncSupervisorPool"
+	OpenShell_GetSupervisorAssignment_FullMethodName        = "/openshell.v1.OpenShell/GetSupervisorAssignment"
+	OpenShell_RequestSupervisorRecoveryGrant_FullMethodName = "/openshell.v1.OpenShell/RequestSupervisorRecoveryGrant"
+	OpenShell_ActivateSupervisorAssignment_FullMethodName   = "/openshell.v1.OpenShell/ActivateSupervisorAssignment"
+	OpenShell_RenewSupervisorLease_FullMethodName           = "/openshell.v1.OpenShell/RenewSupervisorLease"
 )
 
 // OpenShellClient is the client API for OpenShell service.
@@ -339,6 +344,16 @@ type OpenShellClient interface {
 	RemoveWorkspaceMember(ctx context.Context, in *RemoveWorkspaceMemberRequest, opts ...grpc.CallOption) (*RemoveWorkspaceMemberResponse, error)
 	// List members of a workspace.
 	ListWorkspaceMembers(ctx context.Context, in *ListWorkspaceMembersRequest, opts ...grpc.CallOption) (*ListWorkspaceMembersResponse, error)
+	// Heartbeat a pool replica and return the sandboxes assigned to it.
+	SyncSupervisorPool(ctx context.Context, in *SyncSupervisorPoolRequest, opts ...grpc.CallOption) (*SyncSupervisorPoolResponse, error)
+	// Fetch scoped launch material for one assigned sandbox session.
+	GetSupervisorAssignment(ctx context.Context, in *GetSupervisorAssignmentRequest, opts ...grpc.CallOption) (*GetSupervisorAssignmentResponse, error)
+	// Obtain gateway-signed recovery authority for a reserved ownership epoch.
+	RequestSupervisorRecoveryGrant(ctx context.Context, in *RequestSupervisorRecoveryGrantRequest, opts ...grpc.CallOption) (*RequestSupervisorRecoveryGrantResponse, error)
+	// Submit a runtime fencing receipt and activate the reserved epoch.
+	ActivateSupervisorAssignment(ctx context.Context, in *ActivateSupervisorAssignmentRequest, opts ...grpc.CallOption) (*ActivateSupervisorAssignmentResponse, error)
+	// Renew the current owner's enforced lease.
+	RenewSupervisorLease(ctx context.Context, in *RenewSupervisorLeaseRequest, opts ...grpc.CallOption) (*RenewSupervisorLeaseResponse, error)
 }
 
 type openShellClient struct {
@@ -1215,6 +1230,56 @@ func (c *openShellClient) ListWorkspaceMembers(ctx context.Context, in *ListWork
 	return out, nil
 }
 
+func (c *openShellClient) SyncSupervisorPool(ctx context.Context, in *SyncSupervisorPoolRequest, opts ...grpc.CallOption) (*SyncSupervisorPoolResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SyncSupervisorPoolResponse)
+	err := c.cc.Invoke(ctx, OpenShell_SyncSupervisorPool_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSupervisorAssignment(ctx context.Context, in *GetSupervisorAssignmentRequest, opts ...grpc.CallOption) (*GetSupervisorAssignmentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSupervisorAssignmentResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSupervisorAssignment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) RequestSupervisorRecoveryGrant(ctx context.Context, in *RequestSupervisorRecoveryGrantRequest, opts ...grpc.CallOption) (*RequestSupervisorRecoveryGrantResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RequestSupervisorRecoveryGrantResponse)
+	err := c.cc.Invoke(ctx, OpenShell_RequestSupervisorRecoveryGrant_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ActivateSupervisorAssignment(ctx context.Context, in *ActivateSupervisorAssignmentRequest, opts ...grpc.CallOption) (*ActivateSupervisorAssignmentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActivateSupervisorAssignmentResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ActivateSupervisorAssignment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) RenewSupervisorLease(ctx context.Context, in *RenewSupervisorLeaseRequest, opts ...grpc.CallOption) (*RenewSupervisorLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewSupervisorLeaseResponse)
+	err := c.cc.Invoke(ctx, OpenShell_RenewSupervisorLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // OpenShellServer is the server API for OpenShell service.
 // All implementations must embed UnimplementedOpenShellServer
 // for forward compatibility.
@@ -1446,6 +1511,16 @@ type OpenShellServer interface {
 	RemoveWorkspaceMember(context.Context, *RemoveWorkspaceMemberRequest) (*RemoveWorkspaceMemberResponse, error)
 	// List members of a workspace.
 	ListWorkspaceMembers(context.Context, *ListWorkspaceMembersRequest) (*ListWorkspaceMembersResponse, error)
+	// Heartbeat a pool replica and return the sandboxes assigned to it.
+	SyncSupervisorPool(context.Context, *SyncSupervisorPoolRequest) (*SyncSupervisorPoolResponse, error)
+	// Fetch scoped launch material for one assigned sandbox session.
+	GetSupervisorAssignment(context.Context, *GetSupervisorAssignmentRequest) (*GetSupervisorAssignmentResponse, error)
+	// Obtain gateway-signed recovery authority for a reserved ownership epoch.
+	RequestSupervisorRecoveryGrant(context.Context, *RequestSupervisorRecoveryGrantRequest) (*RequestSupervisorRecoveryGrantResponse, error)
+	// Submit a runtime fencing receipt and activate the reserved epoch.
+	ActivateSupervisorAssignment(context.Context, *ActivateSupervisorAssignmentRequest) (*ActivateSupervisorAssignmentResponse, error)
+	// Renew the current owner's enforced lease.
+	RenewSupervisorLease(context.Context, *RenewSupervisorLeaseRequest) (*RenewSupervisorLeaseResponse, error)
 	mustEmbedUnimplementedOpenShellServer()
 }
 
@@ -1704,6 +1779,21 @@ func (UnimplementedOpenShellServer) RemoveWorkspaceMember(context.Context, *Remo
 }
 func (UnimplementedOpenShellServer) ListWorkspaceMembers(context.Context, *ListWorkspaceMembersRequest) (*ListWorkspaceMembersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListWorkspaceMembers not implemented")
+}
+func (UnimplementedOpenShellServer) SyncSupervisorPool(context.Context, *SyncSupervisorPoolRequest) (*SyncSupervisorPoolResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SyncSupervisorPool not implemented")
+}
+func (UnimplementedOpenShellServer) GetSupervisorAssignment(context.Context, *GetSupervisorAssignmentRequest) (*GetSupervisorAssignmentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSupervisorAssignment not implemented")
+}
+func (UnimplementedOpenShellServer) RequestSupervisorRecoveryGrant(context.Context, *RequestSupervisorRecoveryGrantRequest) (*RequestSupervisorRecoveryGrantResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RequestSupervisorRecoveryGrant not implemented")
+}
+func (UnimplementedOpenShellServer) ActivateSupervisorAssignment(context.Context, *ActivateSupervisorAssignmentRequest) (*ActivateSupervisorAssignmentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ActivateSupervisorAssignment not implemented")
+}
+func (UnimplementedOpenShellServer) RenewSupervisorLease(context.Context, *RenewSupervisorLeaseRequest) (*RenewSupervisorLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RenewSupervisorLease not implemented")
 }
 func (UnimplementedOpenShellServer) mustEmbedUnimplementedOpenShellServer() {}
 func (UnimplementedOpenShellServer) testEmbeddedByValue()                   {}
@@ -3140,6 +3230,96 @@ func _OpenShell_ListWorkspaceMembers_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_SyncSupervisorPool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncSupervisorPoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).SyncSupervisorPool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_SyncSupervisorPool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).SyncSupervisorPool(ctx, req.(*SyncSupervisorPoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSupervisorAssignment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSupervisorAssignmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSupervisorAssignment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSupervisorAssignment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSupervisorAssignment(ctx, req.(*GetSupervisorAssignmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_RequestSupervisorRecoveryGrant_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RequestSupervisorRecoveryGrantRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).RequestSupervisorRecoveryGrant(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_RequestSupervisorRecoveryGrant_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).RequestSupervisorRecoveryGrant(ctx, req.(*RequestSupervisorRecoveryGrantRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ActivateSupervisorAssignment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ActivateSupervisorAssignmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ActivateSupervisorAssignment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ActivateSupervisorAssignment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ActivateSupervisorAssignment(ctx, req.(*ActivateSupervisorAssignmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_RenewSupervisorLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewSupervisorLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).RenewSupervisorLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_RenewSupervisorLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).RenewSupervisorLease(ctx, req.(*RenewSupervisorLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // OpenShell_ServiceDesc is the grpc.ServiceDesc for OpenShell service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -3446,6 +3626,26 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListWorkspaceMembers",
 			Handler:    _OpenShell_ListWorkspaceMembers_Handler,
+		},
+		{
+			MethodName: "SyncSupervisorPool",
+			Handler:    _OpenShell_SyncSupervisorPool_Handler,
+		},
+		{
+			MethodName: "GetSupervisorAssignment",
+			Handler:    _OpenShell_GetSupervisorAssignment_Handler,
+		},
+		{
+			MethodName: "RequestSupervisorRecoveryGrant",
+			Handler:    _OpenShell_RequestSupervisorRecoveryGrant_Handler,
+		},
+		{
+			MethodName: "ActivateSupervisorAssignment",
+			Handler:    _OpenShell_ActivateSupervisorAssignment_Handler,
+		},
+		{
+			MethodName: "RenewSupervisorLease",
+			Handler:    _OpenShell_RenewSupervisorLease_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

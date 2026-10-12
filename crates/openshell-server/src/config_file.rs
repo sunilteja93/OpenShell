@@ -126,6 +126,10 @@ pub struct GatewayFileSection {
     /// Security posture when a sandbox rejects a candidate policy generation.
     #[serde(default)]
     pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
+    /// Supervisor placement: `dedicated` (default) or `gateway` (one shared
+    /// HA supervisor Deployment for the installation).
+    #[serde(default)]
+    pub supervisor_topology: Option<openshell_core::config::SupervisorTopology>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.

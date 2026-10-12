@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for the gateway supervisor topology prototype: two gateway
+# replicas on external PostgreSQL and one shared supervisor Deployment for
+# every sandbox. Expects the caller to provide a PostgreSQL Secret named
+# openshell-ha-pg (see values-high-availability.yaml).
+replicaCount: 2
+
+workload:
+  kind: deployment
+
+server:
+  externalDbSecret: openshell-ha-pg
+
+gatewayConfig:
+  openshell.gateway:
+    supervisor_topology: gateway

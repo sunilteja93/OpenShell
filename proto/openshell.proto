@@ -821,6 +821,149 @@ service OpenShell {
       workspace_role: "user"
     };
   }
+
+  // --- Gateway supervisor topology (prototype, supervisor-recovery.v1) ---
+  //
+  // Shared supervisor pool replicas authenticate every call with their
+  // platform credential (a projected Kubernetes ServiceAccount token). The
+  // handler verifies pool membership through the compute driver; the
+  // descriptor-level mode is "unauthenticated" only because no generic
+  // authenticator applies to pool members.
+
+  // Heartbeat a pool replica and return the sandboxes assigned to it.
+  rpc SyncSupervisorPool(SyncSupervisorPoolRequest) returns (SyncSupervisorPoolResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "unauthenticated"
+    };
+  }
+
+  // Fetch scoped launch material for one assigned sandbox session.
+  rpc GetSupervisorAssignment(GetSupervisorAssignmentRequest)
+      returns (GetSupervisorAssignmentResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "unauthenticated"
+    };
+  }
+
+  // Obtain gateway-signed recovery authority for a reserved ownership epoch.
+  rpc RequestSupervisorRecoveryGrant(RequestSupervisorRecoveryGrantRequest)
+      returns (RequestSupervisorRecoveryGrantResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "unauthenticated"
+    };
+  }
+
+  // Submit a runtime fencing receipt and activate the reserved epoch.
+  rpc ActivateSupervisorAssignment(ActivateSupervisorAssignmentRequest)
+      returns (ActivateSupervisorAssignmentResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "unauthenticated"
+    };
+  }
+
+  // Renew the current owner's enforced lease.
+  rpc RenewSupervisorLease(RenewSupervisorLeaseRequest) returns (RenewSupervisorLeaseResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "unauthenticated"
+    };
+  }
+}
+
+// What a pool replica must do for one assigned sandbox.
+enum SupervisorAssignmentAction {
+  SUPERVISOR_ASSIGNMENT_ACTION_UNSPECIFIED = 0;
+  // Own a fresh runtime generation (ownership epoch 1).
+  SUPERVISOR_ASSIGNMENT_ACTION_LAUNCH = 1;
+  // Fence the previous owner and resume the existing workload.
+  SUPERVISOR_ASSIGNMENT_ACTION_RECOVER = 2;
+  // Keep supervising (already active on this replica).
+  SUPERVISOR_ASSIGNMENT_ACTION_SUPERVISE = 3;
+  // Stop supervising; the sandbox stopped, was deleted, or ownership moved.
+  SUPERVISOR_ASSIGNMENT_ACTION_RELEASE = 4;
+}
+
+message SupervisorPoolAssignment {
+  string sandbox_id = 1;
+  string sandbox_name = 2;
+  string runtime_generation = 3;
+  uint64 ownership_epoch = 4;
+  SupervisorAssignmentAction action = 5;
+  // Credential epoch of this launch. Restarting a sandbox keeps its runtime
+  // generation but advances this epoch, so it identifies a new launch.
+  uint64 credential_epoch = 6;
+}
+
+message SyncSupervisorPoolRequest {
+  // Sandboxes whose sessions are currently running on this replica.
+  repeated string active_sandbox_ids = 1;
+}
+
+message SyncSupervisorPoolResponse {
+  // Stable pool member identity the gateway authenticated.
+  string member_id = 1;
+  repeated SupervisorPoolAssignment assignments = 2;
+  // Interval the replica should wait before the next sync.
+  google.protobuf.Duration sync_interval = 3;
+}
+
+message GetSupervisorAssignmentRequest {
+  string sandbox_id = 1;
+  uint64 ownership_epoch = 2;
+}
+
+message GetSupervisorAssignmentResponse {
+  string sandbox_id = 1;
+  string sandbox_name = 2;
+  uint64 ownership_epoch = 3;
+  SupervisorAssignmentAction action = 4;
+  // JSON `SandboxRuntimeDescriptor` written by the compute driver.
+  bytes runtime_descriptor_json = 5;
+  // JSON `SupervisorAuthBundle` with fresh launch-scoped credentials.
+  bytes auth_bundle_json = 6 [(openshell.options.v1.secret) = true];
+  // JSON main-process specification.
+  string main_process_spec_json = 7;
+  string proxy_ca_cert_pem = 8;
+  string proxy_ca_key_pem = 9 [(openshell.options.v1.secret) = true];
+  string upstream_proxy_ca_pem = 10;
+  // Enforced lease TTL and renewal interval the owner must honor.
+  google.protobuf.Duration lease_ttl = 11;
+  google.protobuf.Duration lease_interval = 12;
+}
+
+message RequestSupervisorRecoveryGrantRequest {
+  string sandbox_id = 1;
+  uint64 ownership_epoch = 2;
+  string supervisor_instance = 3;
+  string candidate_key_pem = 4;
+  string challenge = 5;
+  uint64 runtime_ownership_epoch = 6;
+}
+
+message RequestSupervisorRecoveryGrantResponse {
+  string grant = 1 [(openshell.options.v1.secret) = true];
+  string grant_id = 2;
+}
+
+message ActivateSupervisorAssignmentRequest {
+  string sandbox_id = 1;
+  uint64 ownership_epoch = 2;
+  string supervisor_instance = 3;
+  string signed_receipt = 4;
+}
+
+message ActivateSupervisorAssignmentResponse {
+  string activation = 1 [(openshell.options.v1.secret) = true];
+}
+
+message RenewSupervisorLeaseRequest {
+  string sandbox_id = 1;
+  uint64 ownership_epoch = 2;
+  string supervisor_instance = 3;
+}
+
+message RenewSupervisorLeaseResponse {
+  string lease = 1 [(openshell.options.v1.secret) = true];
+  google.protobuf.Duration lease_ttl = 2;
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the

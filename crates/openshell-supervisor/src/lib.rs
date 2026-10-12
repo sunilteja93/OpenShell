@@ -20,6 +20,7 @@ mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+pub mod pool;
 mod provider_readiness;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -573,6 +574,7 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        &openshell_supervisor_network::run::NetworkingSession::default(),
     )
     .await?;
 
@@ -662,6 +664,86 @@ pub async fn run_sandbox(
             auth_bundle,
             admitted_isolation_backend,
             main_exit_marker,
+            hosted: None,
+        },
+    ))
+    .await
+}
+
+/// Inputs for one sandbox session hosted by a shared (gateway-topology)
+/// supervisor process. Every value is scoped to this session; nothing is read
+/// from process-wide sandbox environment.
+pub struct HostedSessionLaunch {
+    pub sandbox_id: String,
+    pub sandbox_name: String,
+    /// Session-scoped gateway endpoint carrying this session's credentials.
+    pub endpoint: String,
+    pub main_process: openshell_core::sandbox_env::MainProcessConfig,
+    pub workdir: Option<String>,
+    pub ssh_socket_path: String,
+    pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
+    pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
+    pub ownership: openshell_sandbox_backend::ownership::SupervisorOwnership,
+    /// Provisioned per-sandbox proxy CA (certificate, key) paths.
+    pub proxy_ca_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    pub proxy_tls_dir: std::path::PathBuf,
+    /// Set to `true` when the gateway stops or deletes this sandbox. Losing
+    /// ownership is different: the host abandons the session without
+    /// touching the workload so the next owner can resume it.
+    pub terminate: tokio::sync::watch::Receiver<bool>,
+}
+
+struct HostedSessionControl {
+    ownership: openshell_sandbox_backend::ownership::SupervisorOwnership,
+    proxy_ca_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    proxy_tls_dir: std::path::PathBuf,
+    terminate: tokio::sync::watch::Receiver<bool>,
+}
+
+async fn wait_for_hosted_termination(mut terminate: tokio::sync::watch::Receiver<bool>) {
+    if terminate.wait_for(|terminate| *terminate).await.is_err() {
+        // The host dropped the control channel: never act on a stale session.
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Run one sandbox session inside a shared supervisor process.
+///
+/// # Errors
+///
+/// Returns an error when the session cannot attach, confirm, or resume its
+/// boundary.
+pub async fn run_hosted_session(launch: HostedSessionLaunch) -> Result<i32> {
+    Box::pin(run_sandbox_with_backend(
+        &backend_setup::OpenShellBackendSetup,
+        SandboxRunConfig {
+            command: launch.main_process.command,
+            workdir: launch.workdir,
+            timeout_secs: 0,
+            interactive: launch.main_process.tty,
+            await_main_process_attachment: launch.main_process.await_main_process_attachment,
+            sandbox_id: Some(launch.sandbox_id),
+            sandbox: Some(launch.sandbox_name),
+            openshell_endpoint: Some(launch.endpoint),
+            policy_rules: None,
+            policy_data: None,
+            ssh_socket_path: Some(launch.ssh_socket_path),
+            health_socket_path: None,
+            health_port: None,
+            ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
+            upstream_proxy_args: launch.upstream_proxy_args,
+            backend_descriptor: launch.backend_descriptor,
+            auth_bundle: launch.auth_bundle,
+            admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),
+            main_exit_marker: None,
+            hosted: Some(HostedSessionControl {
+                ownership: launch.ownership,
+                proxy_ca_paths: launch.proxy_ca_paths,
+                proxy_tls_dir: launch.proxy_tls_dir,
+                terminate: launch.terminate,
+            }),
         },
     ))
     .await
@@ -688,6 +770,7 @@ struct SandboxRunConfig {
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+    hosted: Option<HostedSessionControl>,
 }
 
 /// Trusted composition chooses the setup before shared admission, policy, and
@@ -718,6 +801,7 @@ async fn run_sandbox_with_backend(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
+        hosted,
     } = config;
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
@@ -737,16 +821,20 @@ async fn run_sandbox_with_backend(
             |s| s.trim().to_string(),
         );
 
-        if !openshell_ocsf::ctx::set_ctx(EventContext {
-            sandbox_id: sandbox_id.clone().unwrap_or_default(),
-            sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
-            container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
-            hostname,
-            product_version: openshell_core::VERSION.to_string(),
-            proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
-            proxy_port: 3128,
-            origin: openshell_ocsf::EventOrigin::Supervisor,
-        }) {
+        // A hosted session's threads already carry its own context; only a
+        // dedicated supervisor owns the process-wide context.
+        if hosted.is_none()
+            && !openshell_ocsf::ctx::set_ctx(EventContext {
+                sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
+                container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                hostname,
+                product_version: openshell_core::VERSION.to_string(),
+                proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+                proxy_port: 3128,
+                origin: openshell_ocsf::EventOrigin::Supervisor,
+            })
+        {
             debug!("OCSF context already initialized, keeping existing");
         }
     }
@@ -763,7 +851,10 @@ async fn run_sandbox_with_backend(
         sandbox_id.as_deref(),
         &auth_bundle,
     )?;
-    let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle_for_endpoint(
+        openshell_endpoint.as_deref().unwrap_or_default(),
+        &auth_bundle,
+    )?;
     let ssh_host_key = if ssh_socket_path.is_some() {
         Some(openshell_supervisor_process::ssh::parse_host_key(
             auth_bundle.ssh_host_private_key.as_ref(),
@@ -926,6 +1017,7 @@ async fn run_sandbox_with_backend(
                 ca_file_paths: ca_file_paths.clone(),
                 provider_credentials: provider_credentials.clone(),
                 sandbox_bearer,
+                ownership: hosted.as_ref().map(|hosted| hosted.ownership.clone()),
             },
             policy.clone(),
             openshell_isolation_interface::AgentSpec {
@@ -1017,6 +1109,14 @@ async fn run_sandbox_with_backend(
         (ready, backend_name, ca_file_paths)
     };
 
+    let networking_session = openshell_supervisor_network::run::NetworkingSession {
+        proxy_ca_paths: hosted
+            .as_ref()
+            .and_then(|hosted| hosted.proxy_ca_paths.clone()),
+        pin_journal: hosted
+            .as_ref()
+            .map(|hosted| hosted.ownership.pin_journal.clone()),
+    };
     let mut networking = Some(
         openshell_supervisor_network::run::run_networking(
             &policy,
@@ -1039,11 +1139,12 @@ async fn run_sandbox_with_backend(
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
-            None,
+            hosted.as_ref().map(|hosted| hosted.proxy_tls_dir.as_path()),
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
             Some(remote_network_source),
+            &networking_session,
         )
         .await?,
     );
@@ -1285,8 +1386,13 @@ async fn run_sandbox_with_backend(
             .collect::<Result<Vec<_>>>()?;
         let instance_id = boundary_access.instance_id().to_string();
         let wait_agent = agent.clone();
-        let shutdown_requested = wait_for_control_shutdown_signal();
-        tokio::pin!(shutdown_requested);
+        // A hosted session stops only when the gateway stops it; process
+        // signals belong to the shared host.
+        let mut shutdown_requested: Pin<Box<dyn Future<Output = ()> + Send>> = match hosted.as_ref()
+        {
+            Some(hosted) => Box::pin(wait_for_hosted_termination(hosted.terminate.clone())),
+            None => Box::pin(wait_for_control_shutdown_signal()),
+        };
         let wait = async move {
             wait_agent
                 .wait()

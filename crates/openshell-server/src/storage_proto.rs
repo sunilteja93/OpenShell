@@ -143,8 +143,11 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // The gateway supervisor topology prototype adds eleven public messages and
+    // one enum for pool RPCs; assignments use the generic object store, so no
+    // durable protobuf types change.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
+        "54bbcda1ef6f47a9a9684301516161a1107e52666c4927ee17260e6a116a0990";
     const DURABLE_SCHEMA_SHA256: &str =
         "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -189,6 +192,16 @@ mod tests {
         "openshell.v1.OpenShell/PeerGetSandboxProviderStatus|.openshell.v1.GetSandboxProviderStatusRequest|.openshell.v1.GetSandboxProviderStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportEndpointStatus|.openshell.v1.ReportEndpointStatusRequest|.openshell.v1.ReportEndpointStatusResponse|false|false",
         "openshell.v1.OpenShell/PeerReportProviderReadiness|.openshell.v1.ReportProviderReadinessRequest|.openshell.v1.ReportProviderReadinessResponse|false|false",
+    ];
+    // Gateway supervisor topology prototype: shared pool membership,
+    // assignments, and supervisor-recovery.v1 authority. Pool members
+    // authenticate in the handler; nothing here is persisted from the wire.
+    const SUPERVISOR_POOL_RPC_SIGNATURES: [&str; 5] = [
+        "openshell.v1.OpenShell/ActivateSupervisorAssignment|.openshell.v1.ActivateSupervisorAssignmentRequest|.openshell.v1.ActivateSupervisorAssignmentResponse|false|false",
+        "openshell.v1.OpenShell/GetSupervisorAssignment|.openshell.v1.GetSupervisorAssignmentRequest|.openshell.v1.GetSupervisorAssignmentResponse|false|false",
+        "openshell.v1.OpenShell/RenewSupervisorLease|.openshell.v1.RenewSupervisorLeaseRequest|.openshell.v1.RenewSupervisorLeaseResponse|false|false",
+        "openshell.v1.OpenShell/RequestSupervisorRecoveryGrant|.openshell.v1.RequestSupervisorRecoveryGrantRequest|.openshell.v1.RequestSupervisorRecoveryGrantResponse|false|false",
+        "openshell.v1.OpenShell/SyncSupervisorPool|.openshell.v1.SyncSupervisorPoolRequest|.openshell.v1.SyncSupervisorPoolResponse|false|false",
     ];
     // Synthetic SandboxSpec bytes with log level, provider, and command fields,
     // emitted before the gateway-owned attachment epoch field was introduced.
@@ -554,14 +567,24 @@ mod tests {
                 "peer owner RPC is missing or changed: {signature}"
             );
         }
+        for signature in SUPERVISOR_POOL_RPC_SIGNATURES {
+            assert!(
+                methods.iter().any(|method| method == signature),
+                "supervisor pool RPC is missing or changed: {signature}"
+            );
+        }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + SUPERVISOR_POOL_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + SUPERVISOR_POOL_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -569,7 +592,9 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + SUPERVISOR_POOL_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -613,7 +638,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
+                (322, 28),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

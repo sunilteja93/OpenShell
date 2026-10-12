@@ -20,20 +20,51 @@ use tracing_subscriber::layer::Context;
 /// event is dropped. Logging must never block the sandbox.
 #[derive(Clone)]
 pub struct LogPushLayer {
-    sandbox_id: String,
-    tx: mpsc::Sender<SandboxLogLine>,
+    /// Sink for a dedicated supervisor. A shared supervisor has none and
+    /// routes each event to the session that owns the emitting thread.
+    default: Option<LogPushSink>,
     max_level: tracing::Level,
+}
+
+/// Destination for one sandbox's pushed log lines.
+#[derive(Clone)]
+pub struct LogPushSink {
+    pub sandbox_id: String,
+    pub tx: mpsc::Sender<SandboxLogLine>,
+}
+
+thread_local! {
+    static THREAD_SINK: std::cell::RefCell<Option<LogPushSink>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Route events emitted on the calling thread to a hosted session's sink.
+/// Called from each hosted session runtime's thread-start hook.
+pub fn bind_thread_sink(sink: Option<LogPushSink>) {
+    THREAD_SINK.with(|current| *current.borrow_mut() = sink);
 }
 
 impl LogPushLayer {
     pub fn new(sandbox_id: String, tx: mpsc::Sender<SandboxLogLine>) -> Self {
-        let max_level = parse_max_level(std::env::var("OPENSHELL_LOG_PUSH_LEVEL").ok().as_deref());
         Self {
-            sandbox_id,
-            tx,
-            max_level,
+            default: Some(LogPushSink { sandbox_id, tx }),
+            max_level: push_level_from_env(),
         }
     }
+
+    /// Layer for a shared supervisor process: events are pushed only for
+    /// threads that belong to a hosted sandbox session, and always to that
+    /// session's own sandbox.
+    pub fn session_routed() -> Self {
+        Self {
+            default: None,
+            max_level: push_level_from_env(),
+        }
+    }
+}
+
+fn push_level_from_env() -> tracing::Level {
+    parse_max_level(std::env::var("OPENSHELL_LOG_PUSH_LEVEL").ok().as_deref())
 }
 
 /// Resolve the push level filter, defaulting to `INFO` when unset or unparseable.
@@ -50,6 +81,12 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         if *meta.level() > self.max_level {
             return;
         }
+        let Some(sink) = THREAD_SINK
+            .with(|current| current.borrow().clone())
+            .or_else(|| self.default.clone())
+        else {
+            return;
+        };
 
         // OCSF events carry their payload in a thread-local; extract the
         // shorthand representation for the push message. Non-OCSF events
@@ -74,7 +111,7 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         let is_ocsf = meta.target() == openshell_ocsf::OCSF_TARGET;
 
         let log = SandboxLogLine {
-            sandbox_id: self.sandbox_id.clone(),
+            sandbox_id: sink.sandbox_id.clone(),
             event_time: openshell_core::time::timestamp_from_millis(ts).ok(),
             level: if is_ocsf {
                 "OCSF".to_string()
@@ -88,7 +125,7 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         };
 
         // Best-effort: drop if the channel is full (don't block tracing).
-        let _ = self.tx.try_send(log);
+        let _ = sink.tx.try_send(log);
     }
 }
 
@@ -106,6 +143,24 @@ pub fn spawn_log_push_task(
     let handle = tokio::spawn(run_push_loop(endpoint, sandbox_id, rx));
 
     (tx, handle)
+}
+
+/// Create a hosted session's log sink before its runtime threads start, so
+/// the thread-start hook can bind it. Drive the returned receiver with
+/// [`run_session_push`] inside the session runtime.
+#[must_use]
+pub fn session_sink(sandbox_id: String) -> (LogPushSink, mpsc::Receiver<SandboxLogLine>) {
+    let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
+    (LogPushSink { sandbox_id, tx }, rx)
+}
+
+/// Push one hosted session's log lines with that session's credentials.
+pub async fn run_session_push(
+    endpoint: String,
+    sandbox_id: String,
+    rx: mpsc::Receiver<SandboxLogLine>,
+) {
+    run_push_loop(endpoint, sandbox_id, rx).await;
 }
 
 /// Maximum backoff delay between reconnection attempts.
@@ -339,8 +394,10 @@ mod tests {
     fn capture(capacity: usize, f: impl FnOnce()) -> Vec<SandboxLogLine> {
         let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(capacity);
         let layer = LogPushLayer {
-            sandbox_id: "sb-test".to_string(),
-            tx,
+            default: Some(LogPushSink {
+                sandbox_id: "sb-test".to_string(),
+                tx,
+            }),
             max_level: tracing::Level::INFO,
         };
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -351,6 +408,54 @@ mod tests {
             out.push(line);
         }
         out
+    }
+
+    #[test]
+    fn session_routed_layer_attributes_each_thread_to_its_own_sandbox() {
+        let (tx_a, mut rx_a) = mpsc::channel::<SandboxLogLine>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<SandboxLogLine>(8);
+        let subscriber = tracing_subscriber::registry().with(LogPushLayer {
+            default: None,
+            max_level: tracing::Level::INFO,
+        });
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let emit = |sink: Option<LogPushSink>, message: &'static str| {
+            let dispatch = dispatch.clone();
+            std::thread::spawn(move || {
+                bind_thread_sink(sink);
+                tracing::dispatcher::with_default(&dispatch, || tracing::info!("{message}"));
+            })
+            .join()
+            .unwrap();
+        };
+        emit(
+            Some(LogPushSink {
+                sandbox_id: "sandbox-a".to_string(),
+                tx: tx_a,
+            }),
+            "from a",
+        );
+        emit(
+            Some(LogPushSink {
+                sandbox_id: "sandbox-b".to_string(),
+                tx: tx_b,
+            }),
+            "from b",
+        );
+        // Threads outside a hosted session are never pushed for any sandbox.
+        emit(None, "pool control");
+        let line_a = rx_a.try_recv().expect("a line");
+        let line_b = rx_b.try_recv().expect("b line");
+        assert_eq!(
+            (line_a.sandbox_id.as_str(), line_a.message.as_str()),
+            ("sandbox-a", "from a")
+        );
+        assert_eq!(
+            (line_b.sandbox_id.as_str(), line_b.message.as_str()),
+            ("sandbox-b", "from b")
+        );
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
     }
 
     #[test]

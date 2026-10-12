@@ -10,6 +10,7 @@
 
 pub mod boundary_protocol;
 pub mod mediation;
+pub mod ownership;
 mod runtime;
 pub mod sandbox_auth;
 

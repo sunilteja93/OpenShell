@@ -21,3 +21,17 @@ The setup interface stays private to the supervisor. It adds no runtime backend 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.
 
 Console JSON is installed independently of optional file appenders and uses an INFO filter independent of the diagnostic filter. Its runtime enabled flag and target schema version are shared with the existing JSONL file layer. The supervisor retains the writer guards until shutdown. The gateway log push layer continues to emit shorthand only.
+
+## Shared pool mode (prototype)
+
+`openshell-supervisor pool` runs one replica of the gateway supervisor
+topology. It authenticates pool RPCs with its projected token, follows
+gateway assignments, and hosts each assigned sandbox through
+`run_hosted_session` on its own Tokio runtime. The runtime's thread-start hook
+binds the session identity, OCSF context, and log-push sink, so attribution,
+tasks, and cleanup stay per sandbox. Gateway clients use a session-scoped
+endpoint whose credentials live only in that session; dropping the session
+revokes them. A `RELEASE` assignment (stop or delete) terminates the session;
+losing the assignment abandons it without touching the workload so the next
+owner can resume it. Process signals stop the replica, never a hosted
+workload.

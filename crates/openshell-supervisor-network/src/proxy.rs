@@ -620,6 +620,10 @@ async fn preauthorize_transparent_open(
             let _ = completion.send(TcpOpenDecision::Denied(denial));
             return None;
         }
+        if !identity_cache.pins_durable().await {
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
+            return None;
+        }
         completion.send(TcpOpenDecision::RelayReady).ok()?;
         return Some((
             stream,
@@ -666,6 +670,10 @@ async fn preauthorize_transparent_open(
                 "transparent_tcp_policy_local_identity_unavailable",
             );
             let _ = completion.send(TcpOpenDecision::Denied(denial));
+            return None;
+        }
+        if !identity_cache.pins_durable().await {
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
             return None;
         }
         if completion.send(TcpOpenDecision::RelayReady).is_err() {
@@ -834,6 +842,10 @@ async fn preauthorize_transparent_open(
             return None;
         }
     };
+    if !identity_cache.pins_durable().await {
+        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
+        return None;
+    }
     if completion.send(TcpOpenDecision::RelayReady).is_err() {
         return None;
     }

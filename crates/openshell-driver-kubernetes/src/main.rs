@@ -294,6 +294,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            supervisor_topology: openshell_core::config::SupervisorTopology::Dedicated,
         },
         shutdown_rx,
     )

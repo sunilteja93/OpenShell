@@ -329,6 +329,8 @@ pub struct SandboxTlsMaterial {
     pub trust_anchor_pem: String,
     pub certificate_chain_pem: String,
     pub private_key_pem: String,
+    /// SPKI PEM of the runtime's TLS key; verifies runtime-signed recovery receipts.
+    pub server_public_key_pem: String,
 }
 
 impl fmt::Debug for SandboxTlsMaterial {
@@ -388,6 +390,7 @@ pub fn generate_sandbox_tls_material(
         trust_anchor_pem: ca.pem(),
         certificate_chain_pem: sandbox.pem(),
         private_key_pem: sandbox_key.serialize_pem(),
+        server_public_key_pem: sandbox_key.public_key_pem(),
     })
 }
 
@@ -446,6 +449,30 @@ pub struct SandboxRuntimeDescriptor {
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Backend-neutral projection of the validated outer network fence.
     pub outer_fence: OuterFenceGuarantees,
+    /// Present only when the runtime was launched with the versioned
+    /// supervisor recovery extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_recovery: Option<SupervisorRecoveryDescriptor>,
+}
+
+/// Supervisor-side description of the runtime's recovery extension.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorRecoveryDescriptor {
+    pub protocol: String,
+    /// SPKI PEM that verifies runtime-signed fencing receipts.
+    pub receipt_public_key_pem: String,
+}
+
+/// Runtime-side opt-in to fenced supervisor replacement.
+///
+/// Without it the runtime keeps RFC 0012 same-process transport recovery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorRecoveryConfig {
+    pub protocol: String,
+    /// Enforced owner lease. The workload freezes when it lapses.
+    pub lease_ttl_ms: u64,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -517,6 +544,9 @@ pub struct BoundaryConfig {
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
+    /// Opt-in versioned supervisor recovery extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_recovery: Option<SupervisorRecoveryConfig>,
 }
 
 impl fmt::Debug for BoundaryConfig {
@@ -770,9 +800,45 @@ pub enum Request {
     /// plane.
     OpenMediation,
     AcceptNetwork,
+    /// `supervisor-recovery.v1`: ask a frozen runtime for a fresh recovery
+    /// challenge. Allowed without an active connection.
+    RecoveryHello,
+    /// `supervisor-recovery.v1`: fence the previous owner with a
+    /// gateway-signed recovery grant and a candidate key proof.
+    Recover {
+        grant: String,
+        proof: String,
+    },
+    /// `supervisor-recovery.v1`: resume a recovered workload with a
+    /// gateway-signed activation bound to the runtime fencing receipt.
+    ConfirmRecovery {
+        activation: String,
+    },
+    /// `supervisor-recovery.v1`: extend the active owner's enforcement lease.
+    RenewLease {
+        lease: String,
+    },
+    /// `supervisor-recovery.v1`: checkpoint supervisor state that a
+    /// replacement must restore instead of relearning from the workload.
+    StoreRecoveryState {
+        state: SupervisorRecoveryStateWire,
+    },
 }
 
 impl Request {
+    /// Whether this request belongs to the `supervisor-recovery.v1` extension.
+    #[must_use]
+    pub const fn is_supervisor_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::RecoveryHello
+                | Self::Recover { .. }
+                | Self::ConfirmRecovery { .. }
+                | Self::RenewLease { .. }
+                | Self::StoreRecoveryState { .. }
+        )
+    }
+
     /// Whether this control-path request changes generation-owned sandbox
     /// state and therefore must be replayed from the idempotency ledger.
     #[must_use]
@@ -796,6 +862,15 @@ impl Request {
 impl fmt::Debug for Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RecoveryHello => formatter.write_str("RecoveryHello"),
+            Self::Recover { .. } => formatter.write_str("Recover { .. }"),
+            Self::ConfirmRecovery { .. } => formatter.write_str("ConfirmRecovery { .. }"),
+            Self::RenewLease { .. } => formatter.write_str("RenewLease { .. }"),
+            Self::StoreRecoveryState { state } => formatter
+                .debug_struct("StoreRecoveryState")
+                .field("revision", &state.revision)
+                .field("pins", &state.binary_pins.len())
+                .finish(),
             Self::DiscoverPolicy => formatter.write_str("DiscoverPolicy"),
             Self::Attach {
                 supervisor_instance_id: _,
@@ -951,7 +1026,49 @@ pub enum Response {
         kind: BoundaryErrorKind,
         message: String,
     },
+    RecoveryChallenge {
+        protocol: String,
+        challenge: String,
+        ownership_epoch: u64,
+        generation: String,
+    },
+    Recovered {
+        /// Runtime-signed fencing receipt (`openshell-recovery-receipt+jwt`).
+        receipt: String,
+        snapshot: SessionSnapshotWire,
+        /// Policy bound by the original attach. A replacement must reattach
+        /// with exactly this policy.
+        attached_policy: Option<Box<SandboxPolicyWire>>,
+        main_process_id: Option<String>,
+        provider_env_generation: u64,
+        state: Option<SupervisorRecoveryStateWire>,
+    },
+    LeaseRenewed {
+        expires_in_ms: u64,
+    },
+    RecoveryStateStored {
+        revision: u64,
+    },
 }
+
+/// Supervisor-owned enforcement state the runtime retains for a replacement.
+///
+/// The runtime stores this opaque to its own decisions; only the active owner
+/// may write it, and a replacement receives it after fencing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorRecoveryStateWire {
+    /// Monotonic within one ownership epoch lineage.
+    pub revision: u64,
+    /// Trust-on-first-use executable pins: absolute path to SHA-256 hex.
+    pub binary_pins: std::collections::BTreeMap<String, String>,
+    /// Highest gateway policy version the owner enforced.
+    #[serde(default)]
+    pub policy_version: u64,
+}
+
+/// Maximum TOFU pins a runtime retains for recovery.
+pub const MAX_RECOVERY_STATE_PINS: usize = 4096;
 
 /// Sandbox-monotonic timing carried across the boundary protocol.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

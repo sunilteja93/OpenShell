@@ -47,6 +47,10 @@ struct OwnerPayload {
     owner_replica_id: String,
     owner_peer_endpoint: String,
     connected_at_ms: i64,
+    /// Enforcement ownership epoch in the gateway supervisor topology; 0 for
+    /// dedicated supervisors.
+    #[serde(default)]
+    ownership_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +64,7 @@ pub struct OwnerRecord {
     pub connected_at_ms: i64,
     pub updated_at_ms: i64,
     pub resource_version: u64,
+    pub ownership_epoch: u64,
 }
 
 impl OwnerRecord {
@@ -81,6 +86,7 @@ pub struct OwnerGuard {
     connected_at_ms: i64,
     resource_version: u64,
     last_renewed_at: Instant,
+    ownership_epoch: u64,
 }
 
 impl OwnerGuard {
@@ -101,6 +107,7 @@ impl SupervisorOwnerIndex {
         Self { store, ttl }
     }
 
+    #[cfg(test)]
     pub async fn publish(
         &self,
         sandbox_id: &str,
@@ -109,6 +116,32 @@ impl SupervisorOwnerIndex {
         connection_epoch: u64,
         owner_replica_id: &str,
         owner_peer_endpoint: &str,
+    ) -> Result<OwnerGuard, OwnerError> {
+        self.publish_with_ownership(
+            sandbox_id,
+            session_id,
+            supervisor_instance_id,
+            connection_epoch,
+            owner_replica_id,
+            owner_peer_endpoint,
+            0,
+        )
+        .await
+    }
+
+    /// Publish a session whose supervisor holds enforcement ownership
+    /// `ownership_epoch`. A strictly higher ownership epoch supersedes a
+    /// fresh record immediately: the previous owner was already fenced.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_with_ownership(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+        supervisor_instance_id: &str,
+        connection_epoch: u64,
+        owner_replica_id: &str,
+        owner_peer_endpoint: &str,
+        ownership_epoch: u64,
     ) -> Result<OwnerGuard, OwnerError> {
         let connected_at_ms = now_ms();
         let payload = OwnerPayload {
@@ -119,6 +152,7 @@ impl SupervisorOwnerIndex {
             owner_replica_id: owner_replica_id.to_string(),
             owner_peer_endpoint: owner_peer_endpoint.to_string(),
             connected_at_ms,
+            ownership_epoch,
         };
 
         // A previous owner releasing its record between our read and write
@@ -130,10 +164,11 @@ impl SupervisorOwnerIndex {
             let condition = match self.read(sandbox_id).await? {
                 None => WriteCondition::MustCreate,
                 Some(existing)
-                    if can_supersede(
+                    if can_supersede_with_ownership(
                         &existing,
                         supervisor_instance_id,
                         connection_epoch,
+                        ownership_epoch,
                         self.ttl,
                     ) =>
                 {
@@ -156,6 +191,7 @@ impl SupervisorOwnerIndex {
             connected_at_ms,
             resource_version: result.resource_version,
             last_renewed_at: Instant::now(),
+            ownership_epoch,
         })
     }
 
@@ -168,6 +204,7 @@ impl SupervisorOwnerIndex {
             owner_replica_id: guard.owner_replica_id.clone(),
             owner_peer_endpoint: guard.owner_peer_endpoint.clone(),
             connected_at_ms: guard.connected_at_ms,
+            ownership_epoch: guard.ownership_epoch,
         };
 
         match self
@@ -233,6 +270,7 @@ impl SupervisorOwnerIndex {
             connected_at_ms: payload.connected_at_ms,
             updated_at_ms: record.updated_at_ms,
             resource_version: record.resource_version,
+            ownership_epoch: payload.ownership_epoch,
         }))
     }
 
@@ -272,7 +310,20 @@ pub fn can_supersede(
     connection_epoch: u64,
     ttl: Duration,
 ) -> bool {
+    can_supersede_with_ownership(existing, supervisor_instance_id, connection_epoch, 0, ttl)
+}
+
+pub fn can_supersede_with_ownership(
+    existing: &OwnerRecord,
+    supervisor_instance_id: &str,
+    connection_epoch: u64,
+    ownership_epoch: u64,
+    ttl: Duration,
+) -> bool {
     if !existing.is_fresh(ttl) {
+        return true;
+    }
+    if ownership_epoch > existing.ownership_epoch {
         return true;
     }
 
@@ -299,6 +350,7 @@ mod tests {
             connected_at_ms: 0,
             updated_at_ms,
             resource_version: 1,
+            ownership_epoch: 0,
         }
     }
 
@@ -390,6 +442,46 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OwnerError::AlreadyOwned));
+    }
+
+    #[tokio::test]
+    async fn higher_ownership_epoch_supersedes_a_fenced_owner_immediately() {
+        let index = test_index(OWNER_TTL).await;
+        index
+            .publish_with_ownership("sb-1", "old", "instance-a", 1, "replica-a", "local://a", 1)
+            .await
+            .unwrap();
+        // A different supervisor with the same ownership epoch is rejected.
+        assert!(matches!(
+            index
+                .publish_with_ownership("sb-1", "dup", "instance-c", 1, "replica-c", "local://c", 1)
+                .await,
+            Err(OwnerError::AlreadyOwned)
+        ));
+        // The fenced replacement holds a higher epoch and takes over now.
+        let guard = index
+            .publish_with_ownership("sb-1", "new", "instance-b", 1, "replica-b", "local://b", 2)
+            .await
+            .unwrap();
+        let record = index.read("sb-1").await.unwrap().unwrap();
+        assert_eq!(record.session_id, "new");
+        assert_eq!(record.ownership_epoch, 2);
+        // The stale owner cannot reclaim it with its old epoch.
+        assert!(matches!(
+            index
+                .publish_with_ownership(
+                    "sb-1",
+                    "stale",
+                    "instance-a",
+                    2,
+                    "replica-a",
+                    "local://a",
+                    1
+                )
+                .await,
+            Err(OwnerError::AlreadyOwned)
+        ));
+        drop(guard);
     }
 
     #[tokio::test]

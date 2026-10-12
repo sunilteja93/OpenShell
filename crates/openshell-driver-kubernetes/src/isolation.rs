@@ -212,6 +212,18 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub host_gateway_ip: Option<IpAddr>,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
+    /// Gateway supervisor topology: bind the runtime to the shared pool and
+    /// enable fenced supervisor recovery with this receipt key.
+    pub shared_supervisor_pool: Option<SharedSupervisorPoolBinding>,
+}
+
+/// Runtime binding to the installation-wide supervisor pool.
+pub struct SharedSupervisorPoolBinding {
+    /// SPKI PEM of the runtime TLS key, used by the gateway to verify fencing
+    /// receipts.
+    pub receipt_public_key_pem: String,
+    /// Enforced owner lease the runtime applies.
+    pub lease_ttl_ms: u64,
 }
 
 /// Protected workload-pod config and matching sandbox-runtime descriptor.
@@ -235,7 +247,11 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.workload_pod_uid,
             ),
             (
-                "kubernetes.supervisor_pod_uid".to_string(),
+                if self.shared_supervisor_pool.is_some() {
+                    crate::supervisor_pool::SUPERVISOR_POOL_UID_CLAIM.to_string()
+                } else {
+                    "kubernetes.supervisor_pod_uid".to_string()
+                },
                 self.supervisor_pod_uid,
             ),
             (
@@ -256,6 +272,18 @@ impl KubernetesSandboxRuntimeBoundarySpec {
             egress_rule_count: 0,
         }
         .project(&self.generation)?;
+        let recovery_config = self.shared_supervisor_pool.as_ref().map(|binding| {
+            openshell_sandbox_backend::boundary_protocol::SupervisorRecoveryConfig {
+                protocol: openshell_core::jwt::SUPERVISOR_RECOVERY_PROTOCOL.to_string(),
+                lease_ttl_ms: binding.lease_ttl_ms,
+            }
+        });
+        let recovery_descriptor = self.shared_supervisor_pool.map(|binding| {
+            openshell_sandbox_backend::boundary_protocol::SupervisorRecoveryDescriptor {
+                protocol: openshell_core::jwt::SUPERVISOR_RECOVERY_PROTOCOL.to_string(),
+                receipt_public_key_pem: binding.receipt_public_key_pem,
+            }
+        });
         Ok(KubernetesSandboxRuntimeBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
@@ -277,6 +305,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 workload_identity: self.workload_identity.clone(),
                 outer_fence: outer_fence.clone(),
                 child_env: self.child_env,
+                supervisor_recovery: recovery_config,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
@@ -291,6 +320,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
                 outer_fence,
+                supervisor_recovery: recovery_descriptor,
             },
         })
     }
@@ -383,6 +413,7 @@ mod tests {
             )
             .unwrap(),
             child_env: HashMap::new(),
+            shared_supervisor_pool: None,
         }
     }
 

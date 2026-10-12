@@ -101,6 +101,42 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn sync_supervisor_pool(
+        &self,
+        _request: tonic::Request<openshell_core::proto::SyncSupervisorPoolRequest>,
+    ) -> Result<Response<openshell_core::proto::SyncSupervisorPoolResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_supervisor_assignment(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSupervisorAssignmentRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSupervisorAssignmentResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn request_supervisor_recovery_grant(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RequestSupervisorRecoveryGrantRequest>,
+    ) -> Result<Response<openshell_core::proto::RequestSupervisorRecoveryGrantResponse>, Status>
+    {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn activate_supervisor_assignment(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ActivateSupervisorAssignmentRequest>,
+    ) -> Result<Response<openshell_core::proto::ActivateSupervisorAssignmentResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn renew_supervisor_lease(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RenewSupervisorLeaseRequest>,
+    ) -> Result<Response<openshell_core::proto::RenewSupervisorLeaseResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,

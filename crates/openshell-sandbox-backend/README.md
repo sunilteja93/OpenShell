@@ -24,3 +24,27 @@ the execution outcome unknown.
 
 Exec envelopes without an expiration time are rejected. Update the supervisor
 and sandbox runtime together when deploying this protocol change.
+
+## Supervisor recovery extension (prototype)
+
+`supervisor-recovery.v1` is an opt-in, versioned extension to the Sandbox
+Protocol used by the gateway supervisor topology. A runtime enables it only
+when its `BoundaryConfig.supervisor_recovery` is set; otherwise it keeps the
+RFC 0012 rule that only the same supervisor process can reconnect.
+
+- The launch owner holds ownership epoch 1. A replacement asks the frozen
+  runtime for a single-use challenge (`RecoveryHello`), obtains a
+  gateway-signed recovery grant bound to the sandbox, generation, next epoch,
+  its supervisor instance, its ephemeral Ed25519 key, and the challenge, and
+  presents it with a key proof (`Recover`).
+- The runtime accepts only a strictly higher epoch, re-pins the supervisor
+  instance, closes every previous connection, keeps the workload frozen, and
+  returns a fencing receipt signed with its TLS key plus the attached policy,
+  main process, provider publication generation, and checkpointed TOFU pins.
+- The workload resumes only on `ConfirmRecovery` with a gateway activation
+  bound to that receipt's digest. Recovery never calls `StartAgent`.
+- The active owner must forward gateway-signed leases (`RenewLease`). A lapsed
+  lease freezes the workload and starts the bounded recovery window, which a
+  later candidate never extends. Terminate wins over recovery.
+- The owner checkpoints new TOFU pins (`StoreRecoveryState`); a new pin does
+  not authorize traffic until the runtime acknowledged it.

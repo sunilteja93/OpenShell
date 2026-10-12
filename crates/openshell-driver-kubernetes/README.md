@@ -113,6 +113,37 @@ must not create permissive policies, create Pods, read bootstrap Secrets, or
 spoof the OpenShell role labels. Exact supervisor-to-sandbox authorization is
 still enforced by TLS, JWT claims, session generation, and recorded Pod UIDs.
 
+## Gateway Supervisor Topology (Prototype)
+
+With `[openshell.gateway] supervisor_topology = "gateway"`, the gateway sets
+the driver's internal `supervisor_topology` (never driver TOML) and the
+driver reconciles one `openshell-supervisor-pool` Deployment with two replicas
+in the shared sandbox namespace at startup. The Deployment has no owner
+reference, so deleting a sandbox cannot delete it. Its Pod template derives
+from the dedicated supervisor Pod (same unprivileged security context, gateway
+CA trust, and audience-bound projected token) and carries the supervisor
+boundary role, so the namespace-wide workload fence admits it unchanged.
+
+Per sandbox generation the driver still creates the boundary Service, both
+bootstrap Secrets, and the gated workload Pod, but no supervisor Pod. The
+supervisor Secret is owned by the workload Pod and also carries
+`main-process-spec.json`. The runtime binds the claim
+`kubernetes.supervisor_pool_uid` (the Deployment UID) instead of a supervisor
+Pod UID and enables the versioned `supervisor-recovery.v1` extension with a
+10-second enforced owner lease; the descriptor carries the runtime TLS public
+key the gateway uses to verify fencing receipts.
+
+Pool members authenticate pool RPCs with their projected token. The driver
+TokenReviews it, requires the configured sandbox service account in the
+shared namespace, a live Pod with the pool labels, and a controller chain
+Pod -> ReplicaSet -> the current pool Deployment UID. Only after that does the
+gateway hand an assigned member the generation's supervisor Secret contents.
+Control availability counts the pool as available while one replica is
+Ready. Only `workspace_mode = "shared"` is supported; other modes fail
+configuration validation. In this topology the gateway needs `get` on
+Deployments, ReplicaSets, and Secrets in the sandbox namespace (rendered by
+the Helm Role when the knob is set).
+
 ## Sandbox Resource
 
 The driver works with the `agents.x-k8s.io` `Sandbox` custom resource. It

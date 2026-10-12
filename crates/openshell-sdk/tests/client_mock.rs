@@ -234,6 +234,41 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn sync_supervisor_pool(
+        &self,
+        _request: tonic::Request<proto::SyncSupervisorPoolRequest>,
+    ) -> Result<Response<proto::SyncSupervisorPoolResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_supervisor_assignment(
+        &self,
+        _request: tonic::Request<proto::GetSupervisorAssignmentRequest>,
+    ) -> Result<Response<proto::GetSupervisorAssignmentResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn request_supervisor_recovery_grant(
+        &self,
+        _request: tonic::Request<proto::RequestSupervisorRecoveryGrantRequest>,
+    ) -> Result<Response<proto::RequestSupervisorRecoveryGrantResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn activate_supervisor_assignment(
+        &self,
+        _request: tonic::Request<proto::ActivateSupervisorAssignmentRequest>,
+    ) -> Result<Response<proto::ActivateSupervisorAssignmentResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn renew_supervisor_lease(
+        &self,
+        _request: tonic::Request<proto::RenewSupervisorLeaseRequest>,
+    ) -> Result<Response<proto::RenewSupervisorLeaseResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<proto::ReportProviderReadinessRequest>,
