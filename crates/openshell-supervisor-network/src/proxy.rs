@@ -5009,6 +5009,27 @@ fn rewrite_forward_request(
     canonical_authority: &str,
     secret_resolver: Option<&SecretResolver>,
 ) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
+    rewrite_forward_request_inner(raw, used, path, canonical_authority, secret_resolver, false)
+}
+
+fn rewrite_sigv4_forward_request(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    canonical_authority: &str,
+    secret_resolver: Option<&SecretResolver>,
+) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
+    rewrite_forward_request_inner(raw, used, path, canonical_authority, secret_resolver, true)
+}
+
+fn rewrite_forward_request_inner(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    canonical_authority: &str,
+    secret_resolver: Option<&SecretResolver>,
+    strip_sigv4_auth_headers: bool,
+) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -5081,6 +5102,18 @@ fn rewrite_forward_request(
 
         // Reconstruct hop-by-hop upgrade fields after processing the originals.
         if field_name == "connection" || field_name == "upgrade" {
+            continue;
+        }
+
+        // The trusted signer replaces these client-supplied fields. Drop them
+        // before placeholder resolution, while preserving X-Amz-Content-Sha256
+        // so the relay can still detect the client's payload-signing mode.
+        if strip_sigv4_auth_headers
+            && matches!(
+                field_name.as_str(),
+                "authorization" | "x-amz-date" | "x-amz-security-token"
+            )
+        {
             continue;
         }
 
@@ -6454,13 +6487,39 @@ async fn handle_forward_proxy(
     }
 
     // 9. Rewrite request and forward to upstream
-    let rewritten = match rewrite_forward_request(
-        &forward_request_bytes,
-        forward_request_bytes.len(),
-        &upstream_target,
-        &canonical_authority,
-        secret_resolver.as_deref(),
-    ) {
+    let credential_signing = forward_upgrade_config
+        .as_ref()
+        .map_or(crate::l7::CredentialSigning::None, |config| {
+            config.credential_signing
+        });
+    let sigv4_request_resolver = if credential_signing.is_sigv4() {
+        secret_resolver
+            .as_deref()
+            .map(|resolver| resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS))
+    } else {
+        None
+    };
+    let request_resolver = sigv4_request_resolver
+        .as_ref()
+        .or(secret_resolver.as_deref());
+    let rewritten_result = if credential_signing.is_sigv4() {
+        rewrite_sigv4_forward_request(
+            &forward_request_bytes,
+            forward_request_bytes.len(),
+            &upstream_target,
+            &canonical_authority,
+            request_resolver,
+        )
+    } else {
+        rewrite_forward_request(
+            &forward_request_bytes,
+            forward_request_bytes.len(),
+            &upstream_target,
+            &canonical_authority,
+            request_resolver,
+        )
+    };
+    let rewritten = match rewritten_result {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -6655,11 +6714,6 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    let credential_signing = forward_upgrade_config
-        .as_ref()
-        .map_or(crate::l7::CredentialSigning::None, |config| {
-            config.credential_signing
-        });
     let signing_service = forward_upgrade_config
         .as_ref()
         .map_or("", |config| config.signing_service.as_str());
@@ -13646,6 +13700,202 @@ network_policies:
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn forward_sigv4_rewrite_rejects_signing_credential_in_request_header() {
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(
+                [
+                    ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+                    (
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        "secret-value".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                TestHashMap::new(),
+                7,
+            );
+        let resolver = SecretResolver::merge(
+            [generation_resolver.as_ref(), current_resolver.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
+        .expect("combined resolver");
+        let request_resolver =
+            resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS);
+        let raw = format!(
+            "GET http://host/p HTTP/1.1\r\n\
+             Host: host\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential={}/scope\r\n\
+             x-amz-meta-value: {}\r\n\r\n",
+            child_env["AWS_ACCESS_KEY_ID"], child_env["AWS_SECRET_ACCESS_KEY"]
+        );
+        let error = rewrite_sigv4_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/p",
+            "host",
+            Some(&request_resolver),
+        )
+        .expect_err("signing credential must be rejected before forward relay");
+
+        assert!(error.is_endpoint_mismatch());
+    }
+
+    #[test]
+    fn forward_sigv4_rewrite_preserves_payload_hint_while_replacing_auth_headers() {
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(
+                [
+                    ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+                    ("AWS_SESSION_TOKEN".to_string(), "session-value".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                TestHashMap::new(),
+                7,
+            );
+        let resolver = SecretResolver::merge(
+            [generation_resolver.as_ref(), current_resolver.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
+        .expect("combined resolver");
+        let request_resolver =
+            resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS);
+        let raw = format!(
+            "PUT http://host/bucket/key HTTP/1.1\r\n\
+             Host: host\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential={}/scope\r\n\
+             X-Amz-Date: 20261012T000000Z\r\n\
+             X-Amz-Security-Token: {}\r\n\
+             X-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n\r\n",
+            child_env["AWS_ACCESS_KEY_ID"], child_env["AWS_SESSION_TOKEN"]
+        );
+
+        let rewritten = rewrite_sigv4_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/bucket/key",
+            "host",
+            Some(&request_resolver),
+        )
+        .expect("old auth headers are replaced by the trusted signer");
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        let rewritten_lower = rewritten.to_ascii_lowercase();
+
+        assert!(!rewritten_lower.contains("authorization:"));
+        assert!(!rewritten_lower.contains("x-amz-date:"));
+        assert!(!rewritten_lower.contains("x-amz-security-token:"));
+        assert!(rewritten.contains("X-Amz-Content-Sha256: UNSIGNED-PAYLOAD"));
+    }
+
+    #[tokio::test]
+    async fn forward_sigv4_rewrite_preserves_streaming_payload_mode_through_relay() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [
+                ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "secret-value".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let request_resolver =
+            resolver.with_denied_env_keys(crate::l7::rest::SIGV4_SIGNING_ENV_KEYS);
+        let body = "3\r\nabc\r\n0\r\nx-amz-checksum-crc32: AAAA==\r\n\r\n";
+        let raw = format!(
+            "PUT http://s3.us-east-1.amazonaws.com/bucket/key HTTP/1.1\r\n\
+             Host: s3.us-east-1.amazonaws.com\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential={}/scope\r\n\
+             X-Amz-Date: 20261012T000000Z\r\n\
+             X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+             Content-Encoding: aws-chunked\r\n\
+             Transfer-Encoding: chunked\r\n\
+             X-Amz-Trailer: x-amz-checksum-crc32\r\n\r\n{body}",
+            child_env["AWS_ACCESS_KEY_ID"]
+        );
+        let rewritten = rewrite_sigv4_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/bucket/key",
+            "s3.us-east-1.amazonaws.com",
+            Some(&request_resolver),
+        )
+        .expect("forward rewrite");
+        let guard = forward_test_guard();
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(16 * 1024);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(16 * 1024);
+        let body_bytes = body.as_bytes().to_vec();
+        let upstream_task = tokio::spawn(async move {
+            let mut forwarded = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let read = upstream_side.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0, "upstream request ended before chunk trailers");
+                forwarded.extend_from_slice(&buf[..read]);
+                if forwarded.ends_with(&body_bytes) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            forwarded
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_rewritten_forward_request(
+                "PUT",
+                "/bucket/key",
+                rewritten,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                ForwardRelayOptions {
+                    generation_guard: &guard,
+                    credential_generation: None,
+                    body_classifier: None,
+                    websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                    secret_resolver: Some(&resolver),
+                    request_body_credential_rewrite: false,
+                    deny_uninspected_credentials: false,
+                    credential_signing: crate::l7::CredentialSigning::SigV4,
+                    signing_service: "s3",
+                    signing_region: "us-east-1",
+                    host: "s3.us-east-1.amazonaws.com",
+                    port: 80,
+                    response_middleware: None,
+                    endpoint_observer: None,
+                },
+            ),
+        )
+        .await
+        .expect("relay must not deadlock")
+        .expect("relay should preserve supported streaming mode");
+        drop(proxy_to_upstream);
+        let forwarded = upstream_task.await.expect("upstream task");
+        let forwarded_headers = String::from_utf8_lossy(
+            &forwarded[..forwarded
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("forwarded header terminator")
+                + 4],
+        );
+
+        assert!(
+            forwarded_headers
+                .contains("x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n")
+        );
+        assert!(forwarded_headers.contains("authorization: AWS4-HMAC-SHA256"));
+        assert!(forwarded.ends_with(body.as_bytes()));
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@
 
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings,
+    UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
@@ -208,6 +209,10 @@ fn build_signing_params<'a>(
 ) -> Result<aws_sigv4::http_request::SigningParams<'a>> {
     let mut settings = SigningSettings::default();
     settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    if service == "s3" {
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    }
 
     Ok(v4::SigningParams::builder()
         .identity(identity)
@@ -374,6 +379,37 @@ pub fn apply_sigv4_headers_only_with_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_signing_uses_service_specific_path_settings() {
+        let identity = build_identity("access-key", "secret-key", None);
+        let params = build_signing_params(&identity, "us-east-1", "s3").unwrap();
+
+        assert_eq!(
+            params.settings().percent_encoding_mode,
+            PercentEncodingMode::Single
+        );
+        assert_eq!(
+            params.settings().uri_path_normalization_mode,
+            UriPathNormalizationMode::Disabled
+        );
+    }
+
+    #[test]
+    fn non_s3_signing_preserves_default_path_settings() {
+        let identity = build_identity("access-key", "secret-key", None);
+        let params = build_signing_params(&identity, "us-east-1", "bedrock").unwrap();
+        let defaults = SigningSettings::default();
+
+        assert_eq!(
+            params.settings().percent_encoding_mode,
+            defaults.percent_encoding_mode
+        );
+        assert_eq!(
+            params.settings().uri_path_normalization_mode,
+            defaults.uri_path_normalization_mode
+        );
+    }
 
     #[test]
     fn extract_region_from_hostname() {

@@ -411,6 +411,30 @@ impl SecretResolver {
         }
     }
 
+    /// Return a resolver view that rejects the listed environment keys.
+    ///
+    /// This is used when trusted transforms need a credential internally but
+    /// untrusted request content must not be able to resolve the same key.
+    #[must_use]
+    pub fn with_denied_env_keys(&self, env_keys: &[&str]) -> Self {
+        let mut denied_env_keys = self.denied_env_keys.clone();
+        denied_env_keys.extend(env_keys.iter().map(|key| (*key).to_string()));
+        let by_placeholder = self
+            .by_placeholder
+            .iter()
+            .filter(|(placeholder, _)| {
+                placeholder_env_key(placeholder).is_none_or(|key| !denied_env_keys.contains(key))
+            })
+            .map(|(placeholder, secret)| (placeholder.clone(), secret.clone()))
+            .collect();
+        Self {
+            by_placeholder,
+            denied_env_keys,
+            identity_bound_env_keys: self.identity_bound_env_keys.clone(),
+            revision_fallback_allowed_revisions: self.revision_fallback_allowed_revisions.clone(),
+        }
+    }
+
     fn unresolved_for(
         &self,
         location: &'static str,
@@ -1517,6 +1541,103 @@ mod tests {
                 .and_then(|resolver| resolver
                     .resolve_placeholder("openshell:resolve:env:ANTHROPIC_API_KEY")),
             Some("sk-test")
+        );
+    }
+
+    #[test]
+    fn denied_env_key_view_separates_request_content_from_trusted_resolution() {
+        const SIGNING_KEYS: &[&str] = &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ];
+        let provider_env: HashMap<String, String> = [
+            ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "secret-value".to_string(),
+            ),
+            ("AWS_SESSION_TOKEN".to_string(), "session-value".to_string()),
+            ("API_TOKEN".to_string(), "allowed-value".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let stable_handles = SIGNING_KEYS
+            .iter()
+            .enumerate()
+            .map(|(index, key)| ((*key).to_string(), format!("{:064x}", index + 1)))
+            .collect::<HashMap<_, _>>();
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(
+                provider_env.clone(),
+                HashMap::new(),
+                7,
+            );
+        let (stable_child_env, stable_generation_resolver, stable_current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
+                provider_env,
+                HashMap::new(),
+                7,
+                &stable_handles,
+            );
+        let resolver = SecretResolver::merge(
+            [
+                generation_resolver.as_ref(),
+                current_resolver.as_ref(),
+                stable_generation_resolver.as_ref(),
+                stable_current_resolver.as_ref(),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+        .expect("combined resolver");
+        let request_resolver = resolver.with_denied_env_keys(SIGNING_KEYS);
+
+        for key in SIGNING_KEYS {
+            assert!(
+                resolver
+                    .resolve_current_env_key_checked(key, "trusted-transform")
+                    .expect("trusted lookup")
+                    .is_some()
+            );
+
+            for placeholder in [
+                placeholder_for_env_key(key),
+                child_env[*key].clone(),
+                stable_child_env[*key].clone(),
+                format!("provider-{PROVIDER_ALIAS_MARKER}{key}"),
+            ] {
+                assert!(
+                    resolver.resolve_placeholder(&placeholder).is_some(),
+                    "test placeholder must resolve before it is denied"
+                );
+
+                let error = request_resolver
+                    .rewrite_header_value(&placeholder)
+                    .expect_err("signing key must be unavailable to request content");
+                assert!(error.is_endpoint_mismatch());
+
+                let basic =
+                    base64::engine::general_purpose::STANDARD.encode(format!("user:{placeholder}"));
+                let error = request_resolver
+                    .rewrite_header_value(&format!("Basic {basic}"))
+                    .expect_err("signing key must be denied inside Basic authentication");
+                assert!(error.is_endpoint_mismatch());
+
+                for target in [format!("/{placeholder}"), format!("/?value={placeholder}")] {
+                    let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+                    let error = rewrite_http_header_block(raw.as_bytes(), Some(&request_resolver))
+                        .expect_err("signing key must be rejected in request target");
+                    assert!(error.is_endpoint_mismatch());
+                }
+            }
+        }
+
+        assert_eq!(
+            request_resolver
+                .rewrite_header_value(&child_env["API_TOKEN"])
+                .expect("non-signing key lookup"),
+            Some("allowed-value".to_string())
         );
     }
 

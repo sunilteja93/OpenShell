@@ -48,6 +48,11 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const SIGV4_SIGNING_ENV_KEYS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
     let chain = openshell_supervisor_middleware::ChainRunner::new(
@@ -945,8 +950,18 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
+    // The signer may resolve AWS credentials selected by trusted supervisor
+    // code, but workload-controlled request fields must never materialize them.
+    let sigv4_request_resolver = if options.credential_signing.is_sigv4() {
+        options
+            .resolver
+            .map(|resolver| resolver.with_denied_env_keys(SIGV4_SIGNING_ENV_KEYS))
+    } else {
+        None
+    };
+    let request_resolver = sigv4_request_resolver.as_ref().or(options.resolver);
     let rewrite_result =
-        rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
+        rewrite_http_header_block(&header_bytes, request_resolver).map_err(miette::Report::new)?;
 
     if let Some(validation) = options.mcp_request_validation {
         // Header credential resolution and hop-by-hop cleanup must finish
@@ -10454,6 +10469,95 @@ mod tests {
             "Non-secret query params should be preserved, got: {forwarded}"
         );
         assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_sigv4_rejects_signing_credential_in_request_header() {
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(
+                [
+                    ("AWS_ACCESS_KEY_ID".to_string(), "AKIATESTKEY".to_string()),
+                    (
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        "test-secret-key".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                HashMap::new(),
+                7,
+            );
+        let resolver = SecretResolver::merge(
+            [generation_resolver.as_ref(), current_resolver.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
+        .expect("combined resolver");
+        let placeholder = &child_env["AWS_SECRET_ACCESS_KEY"];
+        let raw_header = format!(
+            "GET / HTTP/1.1\r\n\
+             Host: s3.us-east-1.amazonaws.com\r\n\
+             x-amz-meta-value: {placeholder}\r\n\r\n"
+        )
+        .into_bytes();
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/".to_string(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let upstream_task = tokio::spawn(async move {
+            let mut forwarded = vec![0; 8192];
+            let mut total = 0;
+            loop {
+                let read = upstream_side.read(&mut forwarded[total..]).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                total += read;
+                if forwarded[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    upstream_side
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    break;
+                }
+            }
+            forwarded.truncate(total);
+            forwarded
+        });
+
+        let result = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver: Some(&resolver),
+                credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                signing_service: "s3",
+                signing_region: "us-east-1",
+                host: "s3.us-east-1.amazonaws.com",
+                port: 443,
+                ..Default::default()
+            },
+        )
+        .await;
+        drop(proxy_to_upstream);
+        let forwarded = upstream_task.await.expect("upstream task");
+
+        let error = result.expect_err("signing credentials in request content must be rejected");
+        assert!(
+            error
+                .downcast_ref::<openshell_core::secrets::UnresolvedPlaceholderError>()
+                .is_some_and(
+                    openshell_core::secrets::UnresolvedPlaceholderError::is_endpoint_mismatch,
+                )
+        );
+        assert!(forwarded.is_empty(), "rejected request reached upstream");
     }
 
     #[tokio::test]
