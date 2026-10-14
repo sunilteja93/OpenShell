@@ -54,6 +54,8 @@ pub enum CanonicalizeError {
     PathTooLong,
     #[error("request-target is not a valid origin-form path")]
     MalformedTarget,
+    #[error("request-target requires a path rewrite which is not allowed on this endpoint")]
+    PathRewriteNotAllowed,
 }
 
 /// Options controlling canonicalization strictness.
@@ -72,6 +74,10 @@ pub struct CanonicalizeOptions {
     /// historically used to bypass ACLs and are not part of any policy
     /// we author.
     pub strip_path_parameters: bool,
+    /// Reject the request when canonicalization would change the path bytes.
+    /// This is required for services such as S3 whose object keys preserve
+    /// repeated slashes and dot segments instead of normalizing them.
+    pub reject_path_rewrite: bool,
 }
 
 impl Default for CanonicalizeOptions {
@@ -79,6 +85,7 @@ impl Default for CanonicalizeOptions {
         Self {
             allow_encoded_slash: false,
             strip_path_parameters: true,
+            reject_path_rewrite: false,
         }
     }
 }
@@ -208,7 +215,14 @@ pub fn canonicalize_request_target(
     //     any byte that must be percent-encoded in the pchar set.
     let canonical = build_canonical_path(&resolved, decoded.last().copied() == Some(b'/'), *opts);
 
-    let rewritten = canonical != raw_path;
+    let path_rewritten = canonical != raw_path;
+    if path_rewritten && opts.reject_path_rewrite {
+        return Err(CanonicalizeError::PathRewriteNotAllowed);
+    }
+    // L7 forwarding always uses origin-form. Converting a validated
+    // absolute-form target does not alter its path bytes and therefore is
+    // safe even for byte-exact S3 object keys.
+    let rewritten = path_rewritten || absolute_form_uri.is_some();
     Ok((
         CanonicalPath {
             path: canonical,
@@ -449,6 +463,40 @@ mod tests {
     }
 
     #[test]
+    fn byte_exact_paths_reject_every_canonicalization_rewrite() {
+        let opts = CanonicalizeOptions {
+            reject_path_rewrite: true,
+            ..CanonicalizeOptions::default()
+        };
+
+        for target in [
+            "/bucket/a//b",
+            "/bucket/a/../b",
+            "/bucket/a%3Db",
+            "/bucket/key;version=1",
+        ] {
+            assert_eq!(
+                canon_with(target, opts),
+                Err(CanonicalizeError::PathRewriteNotAllowed),
+                "target {target:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_exact_paths_accept_canonical_targets() {
+        let opts = CanonicalizeOptions {
+            reject_path_rewrite: true,
+            ..CanonicalizeOptions::default()
+        };
+
+        assert_eq!(
+            canon_with("/bucket/a+b=c@d%20e", opts).unwrap(),
+            "/bucket/a+b=c@d%20e"
+        );
+    }
+
+    #[test]
     fn encoded_slash_rejected_by_default() {
         assert_eq!(
             canon("/a/%2f/b"),
@@ -498,6 +546,19 @@ mod tests {
         assert_eq!(canon("http://host/a/../b").unwrap(), "/b");
         assert_eq!(canon("https://host").unwrap(), "/");
         assert_eq!(canon("http://host:443/foo").unwrap(), "/foo");
+
+        let options = CanonicalizeOptions {
+            reject_path_rewrite: true,
+            ..Default::default()
+        };
+        let (path, query) = canonicalize_request_target(
+            "https://s3.us-east-1.amazonaws.com/bucket/key?versionId=1",
+            &options,
+        )
+        .expect("absolute-form conversion preserves exact object-key bytes");
+        assert_eq!(path.path, "/bucket/key");
+        assert!(path.rewritten, "the outbound request must use origin-form");
+        assert_eq!(query.as_deref(), Some("versionId=1"));
     }
 
     #[test]

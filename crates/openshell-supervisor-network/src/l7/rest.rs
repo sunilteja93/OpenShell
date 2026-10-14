@@ -1278,6 +1278,7 @@ where
             websocket_extensions: options.websocket_extensions,
             websocket: websocket_response,
             client_requested_upgrade,
+            suppress_signed_non_success_details: options.credential_signing.is_sigv4(),
             observer,
         },
         response_middleware,
@@ -5851,6 +5852,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s3_sigv4_parser_rejects_object_key_path_rewrites() {
+        let options = crate::l7::path::CanonicalizeOptions {
+            reject_path_rewrite: true,
+            ..Default::default()
+        };
+
+        for target in ["/bucket/a//b", "/bucket/a/../b", "/bucket/a%3Db"] {
+            let (mut client, mut peer) = tokio::io::duplex(4096);
+            peer.write_all(
+                format!("GET {target} HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            let error = parse_http_request(&mut client, &options)
+                .await
+                .expect_err("S3 object-key rewrites must fail before policy or signing");
+            assert!(
+                error.to_string().contains("path rewrite"),
+                "unexpected rejection for {target:?}: {error}"
+            );
+        }
+
+        let (mut client, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(
+            b"GET /bucket/a+b=c@d%20e HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let request = parse_http_request(&mut client, &options)
+            .await
+            .unwrap()
+            .expect("canonical request");
+        assert_eq!(request.target, "/bucket/a+b=c@d%20e");
+    }
+
+    #[tokio::test]
     async fn parse_http_request_rejects_absolute_authority_mismatched_with_host() {
         let (mut client, mut peer) = tokio::io::duplex(1024);
         peer.write_all(
@@ -5870,6 +5909,33 @@ mod tests {
                 .to_string()
                 .contains("request authority does not match the Host header"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_sigv4_parser_rewrites_absolute_form_without_rewriting_object_key() {
+        let (mut client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"GET https://s3.us-east-1.amazonaws.com/bucket/a+b%20c?versionId=1 HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let request = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions {
+                reject_path_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("absolute-form request must parse")
+        .expect("request must be present");
+        assert_eq!(request.target, "/bucket/a+b%20c");
+        assert!(
+            request
+                .raw_header
+                .starts_with(b"GET /bucket/a+b%20c?versionId=1 HTTP/1.1\r\n")
         );
     }
 
@@ -10549,10 +10615,98 @@ mod tests {
             error
                 .downcast_ref::<openshell_core::secrets::UnresolvedPlaceholderError>()
                 .is_some_and(
-                    openshell_core::secrets::UnresolvedPlaceholderError::is_endpoint_mismatch,
+                    openshell_core::secrets::UnresolvedPlaceholderError::is_forbidden_in_signed_request,
                 )
         );
         assert!(forwarded.is_empty(), "rejected request reached upstream");
+    }
+
+    #[tokio::test]
+    async fn relay_sigv4_error_response_cannot_reflect_signed_credentials() {
+        let session_token = "SUPER_SECRET_CONNECT_SESSION_TOKEN";
+        let reflected_hex = hex::encode(session_token);
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                ("AWS_ACCESS_KEY_ID".to_string(), "ASIATESTKEY".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "test-secret-key".to_string(),
+                ),
+                ("AWS_SESSION_TOKEN".to_string(), session_token.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/bucket/key".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n"
+                .to_vec(),
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(16 * 1024);
+        let (mut app_side, mut proxy_to_client) = tokio::io::duplex(16 * 1024);
+        let token_for_upstream = session_token.to_string();
+        let hex_for_upstream = reflected_hex.clone();
+        let upstream_task = tokio::spawn(async move {
+            let request = read_http_header_block(&mut upstream_side).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains(&format!("x-amz-security-token: {token_for_upstream}\r\n")));
+
+            let body = format!(
+                "<CanonicalRequest>{token_for_upstream}</CanonicalRequest><CanonicalRequestBytes>{hex_for_upstream}</CanonicalRequestBytes>"
+            );
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\nX-Reflected: {token_for_upstream}\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n",
+                body.len()
+            );
+            let split = head.len() / 2;
+            upstream_side
+                .write_all(&head.as_bytes()[..split])
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            upstream_side
+                .write_all(&head.as_bytes()[split..])
+                .await
+                .unwrap();
+            upstream_side.write_all(body.as_bytes()).await.unwrap();
+            upstream_side.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_options_guarded(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                RelayRequestOptions {
+                    resolver: Some(&resolver),
+                    credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                    signing_service: "s3",
+                    signing_region: "us-east-1",
+                    host: "s3.us-east-1.amazonaws.com",
+                    port: 443,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("relay must not deadlock")
+        .expect("signed rejection must be replaced");
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+        upstream_task.await.expect("upstream task");
+
+        let mut delivered = Vec::new();
+        app_side.read_to_end(&mut delivered).await.unwrap();
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.starts_with("HTTP/1.1 403 Upstream Rejected\r\n"));
+        assert!(delivered.contains("signed_upstream_rejected"));
+        assert!(!delivered.contains(session_token));
+        assert!(!delivered.contains(&reflected_hex));
+        assert!(!delivered.contains("CanonicalRequest"));
     }
 
     #[tokio::test]

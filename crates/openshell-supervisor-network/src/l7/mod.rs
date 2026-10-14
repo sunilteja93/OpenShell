@@ -264,6 +264,19 @@ impl EndpointObserver {
             self.observe(EndpointResult::CredentialUnavailable);
         }
     }
+
+    /// Report a typed credential-resolution failure without conflating a
+    /// signed-request placeholder denial with endpoint binding.
+    pub(crate) fn observe_credential_resolution_failure(
+        &self,
+        error: &openshell_core::secrets::UnresolvedPlaceholderError,
+    ) {
+        if error.is_endpoint_mismatch() || error.is_forbidden_in_signed_request() {
+            self.observe(EndpointResult::PolicyDenied);
+        } else if self.uses_provider_credentials {
+            self.observe(EndpointResult::CredentialUnavailable);
+        }
+    }
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -420,6 +433,10 @@ pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str,
 }
 
 impl L7EndpointConfig {
+    pub(crate) fn requires_byte_exact_path(&self) -> bool {
+        self.credential_signing.is_sigv4() && self.signing_service.eq_ignore_ascii_case("s3")
+    }
+
     pub fn matches_path(&self, path: &str) -> bool {
         endpoint_path_matches(&self.path, path)
     }
@@ -435,6 +452,19 @@ impl L7EndpointConfig {
     pub fn deny_uninspected_body_credentials(&self, has_resolver: bool) -> bool {
         !self.allow_uninspected_credentials && (self.provider_credentialed || has_resolver)
     }
+}
+
+/// Whether any L7 endpoint sharing an authority requires byte-exact paths.
+///
+/// Route selection happens after canonicalization, so an S3 signer makes this
+/// restriction authority-wide. This prevents normalization from selecting or
+/// signing a different S3 object key than the workload sent.
+pub(crate) fn route_requires_byte_exact_path<'a>(
+    configs: impl IntoIterator<Item = &'a L7EndpointConfig>,
+) -> bool {
+    configs
+        .into_iter()
+        .any(L7EndpointConfig::requires_byte_exact_path)
 }
 
 pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
@@ -1946,6 +1976,27 @@ mod tests {
         assert_eq!(config.enforcement, EnforcementMode::Audit);
     }
 
+    #[test]
+    fn s3_signer_makes_byte_exact_paths_authority_wide_for_mixed_routes() {
+        let unsigned = parse_l7_config(
+            &regorus::Value::from_json_str(
+                r#"{"protocol":"rest","path":"/api/**","host":"shared.example.com","port":443}"#,
+            )
+            .unwrap(),
+        )
+        .expect("unsigned route");
+        let s3_signed = parse_l7_config(
+            &regorus::Value::from_json_str(
+                r#"{"protocol":"rest","path":"/bucket/**","host":"shared.example.com","port":443,"credential_signing":"sigv4","signing_service":"s3","signing_region":"us-east-1"}"#,
+            )
+            .unwrap(),
+        )
+        .expect("S3-signed route");
+
+        assert!(!route_requires_byte_exact_path([&unsigned]));
+        assert!(route_requires_byte_exact_path([&unsigned, &s3_signed]));
+    }
+
     #[tokio::test]
     async fn endpoint_observation_classifies_only_bound_credential_failure() {
         use openshell_core::endpoint_status::{
@@ -1982,6 +2033,26 @@ mod tests {
             receiver.recv().await.expect("credential observation"),
             EndpointStatusCommand::Observe {
                 result: EndpointResult::CredentialUnavailable,
+                ..
+            }
+        ));
+
+        let (_, resolver) = openshell_core::secrets::SecretResolver::from_provider_env(
+            std::iter::once(("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string())).collect(),
+        );
+        let request_resolver = resolver
+            .expect("resolver")
+            .without_resolvable_placeholders();
+        let error = request_resolver
+            .rewrite_header_value("openshell:resolve:env:AWS_SECRET_ACCESS_KEY")
+            .expect_err("signed request placeholder denial");
+        let observer = EndpointObserver::begin(Some(&sender), &config).expect("begin observation");
+        observer.observe_credential_resolution_failure(&error);
+
+        assert!(matches!(
+            receiver.recv().await.expect("signed request observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::PolicyDenied,
                 ..
             }
         ));
