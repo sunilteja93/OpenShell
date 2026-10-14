@@ -1155,8 +1155,8 @@ where
             .endpoint_observation_tx
             .as_ref()
             .and_then(EndpointObservationSender::capture);
-        let parsed = match provider.parse_request_with_original_target(client).await {
-            Ok(Some(parsed)) => parsed,
+        let mut req = match provider.parse_request(client).await {
+            Ok(Some(req)) => req,
             Ok(None) => return Ok(()),
             Err(e) => {
                 if is_benign_connection_error(&e) {
@@ -1174,8 +1174,6 @@ where
                 return Ok(());
             }
         };
-        let mut req = parsed.request;
-        let original_target = parsed.original_target;
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
@@ -1210,25 +1208,6 @@ where
             ctx.provider_credential_revision,
             Some(engine.generation_guard()),
         );
-        if let Err(error) = config.validate_byte_exact_request_target(&original_target) {
-            let detail =
-                format!("request-target must be canonical for the selected S3 endpoint: {error}");
-            if let Some(observer) = observer.as_ref() {
-                observer.observe(EndpointResult::PolicyDenied);
-            }
-            emit_parse_rejection(ctx, &detail, engine_type_for_protocol(config.protocol));
-            crate::l7::rest::RestProvider::default()
-                .deny_with_redacted_target(
-                    &req,
-                    &ctx.policy_name,
-                    &detail,
-                    client,
-                    None,
-                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
-                )
-                .await?;
-            return Ok(());
-        }
         // The request was canonicalized before the matching config was known,
         // so `allow_encoded_slash` was taken permissively across every config
         // on this host:port. Re-check it against the config that actually
@@ -2028,7 +2007,6 @@ where
     let provider =
         crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
             allow_encoded_slash: config.allow_encoded_slash,
-            reject_path_rewrite: config.requires_byte_exact_path(),
             ..Default::default()
         });
     loop {
@@ -2452,7 +2430,6 @@ where
             config.json_rpc_max_body_bytes,
             crate::l7::path::CanonicalizeOptions {
                 allow_encoded_slash: config.allow_encoded_slash,
-                reject_path_rewrite: config.requires_byte_exact_path(),
                 ..Default::default()
             },
             crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
@@ -2719,7 +2696,6 @@ where
     let provider =
         crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
             allow_encoded_slash: config.allow_encoded_slash,
-            reject_path_rewrite: config.requires_byte_exact_path(),
             ..Default::default()
         });
 
@@ -8881,7 +8857,7 @@ network_policies:
       - { path: /usr/bin/node }
 "#;
 
-    const S3_PATH_SCOPING_POLICY: &str = r#"
+    const S3_CANONICALIZATION_POLICY: &str = r#"
 network_policies:
   route_api:
     name: route_api
@@ -8912,7 +8888,7 @@ network_policies:
 "#;
 
     async fn relay_mixed_s3_target(target: &str) -> (String, String) {
-        let engine = OpaEngine::from_strings(TEST_POLICY, S3_PATH_SCOPING_POLICY).unwrap();
+        let engine = OpaEngine::from_strings(TEST_POLICY, S3_CANONICALIZATION_POLICY).unwrap();
         let input = NetworkInput {
             host: "gateway.example.test".into(),
             port: 443,
@@ -9007,15 +8983,22 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn route_selected_s3_byte_exact_paths_are_scoped_after_selection() {
+    async fn route_selected_s3_canonicalizes_before_signing() {
         let (response, forwarded) = relay_mixed_s3_target("/api//v1").await;
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(forwarded.starts_with("GET /api/v1 HTTP/1.1"), "{forwarded}");
         assert!(!forwarded.to_ascii_lowercase().contains("authorization:"));
 
         let (response, forwarded) = relay_mixed_s3_target("/api/../bucket/key").await;
-        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
-        assert!(forwarded.is_empty(), "S3 rejection reached upstream");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            forwarded.starts_with("GET /bucket/key HTTP/1.1"),
+            "{forwarded}"
+        );
+        let signed = forwarded.to_ascii_lowercase();
+        assert!(signed.contains("authorization: aws4-hmac-sha256"));
+        assert!(signed.contains("x-amz-"));
+        assert!(!signed.contains("/api/../bucket/key"));
 
         let (response, forwarded) = relay_mixed_s3_target("/bucket/../api/v1").await;
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
@@ -9023,6 +9006,20 @@ network_policies:
         let forwarded = forwarded.to_ascii_lowercase();
         assert!(!forwarded.contains("authorization:"));
         assert!(!forwarded.contains("x-amz-"));
+    }
+
+    #[tokio::test]
+    async fn route_selected_s3_noncanonical_target_rejects_query_placeholder_before_upstream() {
+        let (response, forwarded) = relay_mixed_s3_target(
+            "/api/../bucket/key?leak=openshell%3Aresolve%3Aenv%3AAWS_SECRET_ACCESS_KEY",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(
+            forwarded.is_empty(),
+            "placeholder-bearing signed request reached upstream: {forwarded}"
+        );
     }
 
     fn encoded_slash_scoping_configs() -> Vec<L7EndpointConfig> {

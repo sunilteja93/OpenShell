@@ -433,33 +433,6 @@ pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str,
 }
 
 impl L7EndpointConfig {
-    pub(crate) fn requires_byte_exact_path(&self) -> bool {
-        self.credential_signing.is_sigv4() && self.signing_service.eq_ignore_ascii_case("s3")
-    }
-
-    /// Enforce byte-exact paths after canonical route selection.
-    ///
-    /// Route matching remains based on the canonical path. Only the endpoint
-    /// selected by that match may impose S3's no-rewrite requirement.
-    pub(crate) fn validate_byte_exact_request_target(
-        &self,
-        target: &str,
-    ) -> Result<(), path::CanonicalizeError> {
-        if !self.requires_byte_exact_path() {
-            return Ok(());
-        }
-
-        path::canonicalize_request_target(
-            target,
-            &path::CanonicalizeOptions {
-                allow_encoded_slash: self.allow_encoded_slash,
-                reject_path_rewrite: true,
-                ..Default::default()
-            },
-        )
-        .map(|_| ())
-    }
-
     pub fn matches_path(&self, path: &str) -> bool {
         endpoint_path_matches(&self.path, path)
     }
@@ -1984,36 +1957,6 @@ mod tests {
         assert_eq!(config.protocol, L7Protocol::Rest);
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Audit);
-    }
-
-    #[test]
-    fn byte_exact_paths_are_scoped_to_the_selected_s3_route() {
-        let unsigned = parse_l7_config(
-            &regorus::Value::from_json_str(
-                r#"{"protocol":"rest","path":"/api/**","host":"shared.example.com","port":443}"#,
-            )
-            .unwrap(),
-        )
-        .expect("unsigned route");
-        let s3_signed = parse_l7_config(
-            &regorus::Value::from_json_str(
-                r#"{"protocol":"rest","path":"/bucket/**","host":"shared.example.com","port":443,"credential_signing":"sigv4","signing_service":"s3","signing_region":"us-east-1"}"#,
-            )
-            .unwrap(),
-        )
-        .expect("S3-signed route");
-
-        assert!(
-            unsigned
-                .validate_byte_exact_request_target("/api//v1")
-                .is_ok()
-        );
-        assert_eq!(
-            s3_signed
-                .validate_byte_exact_request_target("/api/../bucket/key")
-                .expect_err("selected S3 route must reject path rewrites"),
-            path::CanonicalizeError::PathRewriteNotAllowed
-        );
     }
 
     #[tokio::test]

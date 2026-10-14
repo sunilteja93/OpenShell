@@ -115,23 +115,6 @@ impl RestProvider {
             canonicalize_options,
         }
     }
-
-    /// Parse a request while retaining the workload's original request-target.
-    ///
-    /// Route-selected relays need the canonical target to choose a policy
-    /// endpoint, then the original target to apply endpoint-specific byte-exact
-    /// requirements before credentials or upstream I/O are involved.
-    pub(crate) async fn parse_request_with_original_target<C: AsyncRead + Unpin>(
-        &self,
-        client: &mut C,
-    ) -> Result<Option<ParsedHttpRequest>> {
-        parse_http_request_with_original_target(client, &self.canonicalize_options).await
-    }
-}
-
-pub(crate) struct ParsedHttpRequest {
-    pub(crate) request: L7Request,
-    pub(crate) original_target: String,
 }
 
 impl L7Provider for RestProvider {
@@ -215,17 +198,6 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     client: &mut C,
     canonicalize_options: &crate::l7::path::CanonicalizeOptions,
 ) -> Result<Option<L7Request>> {
-    Ok(
-        parse_http_request_with_original_target(client, canonicalize_options)
-            .await?
-            .map(|parsed| parsed.request),
-    )
-}
-
-async fn parse_http_request_with_original_target<C: AsyncRead + Unpin>(
-    client: &mut C,
-    canonicalize_options: &crate::l7::path::CanonicalizeOptions,
-) -> Result<Option<ParsedHttpRequest>> {
     let mut buf = Vec::with_capacity(4096);
 
     loop {
@@ -329,15 +301,12 @@ async fn parse_http_request_with_original_target<C: AsyncRead + Unpin>(
         )?;
     }
 
-    Ok(Some(ParsedHttpRequest {
-        request: L7Request {
-            action: method,
-            target: canonical.path,
-            query_params,
-            raw_header: buf, // exact header bytes up to and including \r\n\r\n
-            body_length,
-        },
-        original_target: target,
+    Ok(Some(L7Request {
+        action: method,
+        target: canonical.path,
+        query_params,
+        raw_header: buf, // exact header bytes up to and including \r\n\r\n
+        body_length,
     }))
 }
 
@@ -5883,13 +5852,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_sigv4_parser_rejects_object_key_path_rewrites() {
-        let options = crate::l7::path::CanonicalizeOptions {
-            reject_path_rewrite: true,
-            ..Default::default()
-        };
-
-        for target in ["/bucket/a//b", "/bucket/a/../b", "/bucket/a%3Db"] {
+    async fn s3_sigv4_parser_canonicalizes_object_key_before_signing() {
+        for (target, canonical) in [
+            ("/bucket/a//b", "/bucket/a/b"),
+            ("/bucket/a/../b", "/bucket/b"),
+            ("/bucket/a%3Db", "/bucket/a=b"),
+            ("/bucket/key;version=1", "/bucket/key"),
+        ] {
             let (mut client, mut peer) = tokio::io::duplex(4096);
             peer.write_all(
                 format!("GET {target} HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n")
@@ -5898,26 +5867,21 @@ mod tests {
             .await
             .unwrap();
 
-            let error = parse_http_request(&mut client, &options)
-                .await
-                .expect_err("S3 object-key rewrites must fail before policy or signing");
+            let request = parse_http_request(
+                &mut client,
+                &crate::l7::path::CanonicalizeOptions::default(),
+            )
+            .await
+            .expect("S3 target must parse")
+            .expect("request must be present");
+            assert_eq!(request.target, canonical);
             assert!(
-                error.to_string().contains("path rewrite"),
-                "unexpected rejection for {target:?}: {error}"
+                request
+                    .raw_header
+                    .starts_with(format!("GET {canonical} HTTP/1.1\r\n").as_bytes()),
+                "forwarded request line must use the policy-evaluated canonical path"
             );
         }
-
-        let (mut client, mut peer) = tokio::io::duplex(4096);
-        peer.write_all(
-            b"GET /bucket/a+b=c@d%20e HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n",
-        )
-        .await
-        .unwrap();
-        let request = parse_http_request(&mut client, &options)
-            .await
-            .unwrap()
-            .expect("canonical request");
-        assert_eq!(request.target, "/bucket/a+b=c@d%20e");
     }
 
     #[tokio::test]
@@ -5944,7 +5908,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_sigv4_parser_rewrites_absolute_form_without_rewriting_object_key() {
+    async fn s3_sigv4_parser_rewrites_absolute_form_to_canonical_origin_form() {
         let (mut client, mut peer) = tokio::io::duplex(1024);
         peer.write_all(
             b"GET https://s3.us-east-1.amazonaws.com/bucket/a+b%20c?versionId=1 HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n",
@@ -5954,10 +5918,7 @@ mod tests {
 
         let request = parse_http_request(
             &mut client,
-            &crate::l7::path::CanonicalizeOptions {
-                reject_path_rewrite: true,
-                ..Default::default()
-            },
+            &crate::l7::path::CanonicalizeOptions::default(),
         )
         .await
         .expect("absolute-form request must parse")

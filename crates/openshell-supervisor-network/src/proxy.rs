@@ -5679,7 +5679,6 @@ async fn handle_forward_proxy(
     //     strips hop-by-hop `Connection` headers and drops the upstream after
     //     the response instead of asking the upstream to close it.
     hydrate_l7_route(&mut decision);
-    let original_path = path.clone();
     let canonicalize_options = crate::l7::path::CanonicalizeOptions {
         allow_encoded_slash: decision.endpoint.l7_route.as_ref().is_some_and(|route| {
             route
@@ -5849,41 +5848,6 @@ async fn handle_forward_proxy(
             None,
             Some(&forward_generation_guard),
         );
-        if let Err(error) = l7_config
-            .config
-            .validate_byte_exact_request_target(&original_path)
-        {
-            if let Some(observer) = endpoint_observer.as_ref() {
-                observer.observe(EndpointResult::PolicyDenied);
-            }
-            let detail =
-                format!("request-target must be canonical for the selected S3 endpoint: {error}");
-            ocsf_emit!(build_forward_l7_parse_rejection_ocsf_event(
-                workload_addr,
-                method,
-                &host_lc,
-                port,
-                &telemetry_path,
-                &binary_str,
-                &pid_str,
-                &ancestors_str,
-                &cmdline_str,
-                policy_str,
-                &detail,
-            ));
-            emit_activity_simple(activity_tx, true, "forward_parse_rejection");
-            respond(
-                client,
-                &build_json_error_response(
-                    400,
-                    "Bad Request",
-                    "invalid_request_target",
-                    "request-target must be canonical",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
         // `canonicalize_options` was built before the matching config was
         // known, so `allow_encoded_slash` was taken permissively across every
         // config on this route. Re-check it against the config that actually
@@ -13132,30 +13096,30 @@ network_policies:
     }
 
     #[test]
-    fn forward_s3_sigv4_target_rejects_path_rewrites() {
-        let options = crate::l7::path::CanonicalizeOptions {
-            reject_path_rewrite: true,
-            ..Default::default()
-        };
-
-        for target in [
-            "http://s3.us-east-1.amazonaws.com/bucket/a//b",
-            "http://s3.us-east-1.amazonaws.com/bucket/a/../b",
-            "http://s3.us-east-1.amazonaws.com/bucket/a%3Db",
+    fn forward_s3_sigv4_target_canonicalizes_before_signing() {
+        for (target, expected) in [
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a//b",
+                "/bucket/a/b",
+            ),
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a/../b",
+                "/bucket/b",
+            ),
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a%3Db",
+                "/bucket/a=b",
+            ),
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a+b=c@d%20e",
+                "/bucket/a+b=c@d%20e",
+            ),
         ] {
-            assert_eq!(
-                prepare_forward_target(target, options)
-                    .expect_err("S3 object-key rewrites must fail closed"),
-                crate::l7::path::CanonicalizeError::PathRewriteNotAllowed
-            );
+            let prepared =
+                prepare_forward_target(target, crate::l7::path::CanonicalizeOptions::default())
+                    .expect("S3 target must canonicalize");
+            assert_eq!(prepared.upstream_target, expected);
         }
-
-        let prepared = prepare_forward_target(
-            "http://s3.us-east-1.amazonaws.com/bucket/a+b=c@d%20e",
-            options,
-        )
-        .expect("canonical S3 target");
-        assert_eq!(prepared.upstream_target, "/bucket/a+b=c@d%20e");
     }
 
     #[test]
@@ -15037,6 +15001,16 @@ network_policies:
 
         let (server, _) = listener.accept().await.unwrap();
         let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+        let (_, secret_resolver) = SecretResolver::from_provider_env(TestHashMap::from([
+            (
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "test-access-key".to_string(),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "test-secret-key".to_string(),
+            ),
+        ]));
         Box::pin(handle_tcp_connection(
             server,
             engine,
@@ -15049,7 +15023,7 @@ network_policies:
             Arc::new(None),
             Arc::new(None),
             None,
-            None,
+            secret_resolver.map(Arc::new),
             None,
             Some(denial_tx),
             None,
@@ -15167,7 +15141,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn forward_s3_byte_exact_paths_are_scoped_after_route_selection() {
+    async fn forward_s3_canonicalizes_routes_and_rejects_query_placeholder_before_upstream() {
         if !cfg!(target_os = "linux") {
             eprintln!("skipping: handler identity binding requires /proc (Linux)");
             return;
@@ -15177,10 +15151,14 @@ network_policies:
             return;
         };
 
-        for (raw_path, expected_upstream_path) in [
-            ("/api//v1", Some("/api/v1")),
-            ("/api/../bucket/key", None),
-            ("/bucket/../api/v1", Some("/api/v1")),
+        for (raw_path, expected_upstream) in [
+            ("/api//v1", Some(("/api/v1", false))),
+            ("/api/../bucket/key", Some(("/bucket/key", true))),
+            ("/bucket/../api/v1", Some(("/api/v1", false))),
+            (
+                "/api/../bucket/key?leak=openshell%3Aresolve%3Aenv%3AAWS_SECRET_ACCESS_KEY",
+                None,
+            ),
         ] {
             let upstream_listener = TcpListener::bind((upstream_ip, 0))
                 .await
@@ -15216,26 +15194,35 @@ network_policies:
                 Box::pin(drive_forward_through_handler(&endpoint_yaml, &target)).await;
             let response = String::from_utf8(response).unwrap();
 
-            if let Some(expected_path) = expected_upstream_path {
+            if let Some((expected_upstream_path, expect_sigv4)) = expected_upstream {
                 assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
                 let forwarded =
                     tokio::time::timeout(std::time::Duration::from_secs(1), &mut upstream_task)
                         .await
-                        .expect("unsigned request must reach upstream")
+                        .expect("canonical request must reach upstream")
                         .unwrap();
                 assert!(
-                    forwarded.starts_with(&format!("GET {expected_path} HTTP/1.1")),
+                    forwarded.starts_with(&format!("GET {expected_upstream_path} HTTP/1.1")),
                     "{forwarded}"
                 );
-                let forwarded = forwarded.to_ascii_lowercase();
-                assert!(!forwarded.contains("authorization:"));
-                assert!(!forwarded.contains("x-amz-"));
-            } else {
                 assert!(
-                    response.starts_with("HTTP/1.1 400 Bad Request"),
+                    !forwarded.contains(raw_path),
+                    "raw non-canonical target reached upstream: {forwarded}"
+                );
+                let forwarded = forwarded.to_ascii_lowercase();
+                if expect_sigv4 {
+                    assert!(forwarded.contains("authorization: aws4-hmac-sha256"));
+                    assert!(forwarded.contains("x-amz-"));
+                } else {
+                    assert!(!forwarded.contains("authorization:"));
+                    assert!(!forwarded.contains("x-amz-"));
+                }
+            } else {
+                assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+                assert!(
+                    response.contains("credential_placeholder_forbidden_in_signed_request"),
                     "{response}"
                 );
-                assert!(response.contains("invalid_request_target"), "{response}");
                 assert!(
                     tokio::time::timeout(
                         std::time::Duration::from_millis(100),
@@ -15243,7 +15230,7 @@ network_policies:
                     )
                     .await
                     .is_err(),
-                    "selected S3 rejection must happen before upstream connect"
+                    "query placeholder rejection must happen before upstream connect"
                 );
                 upstream_task.abort();
                 let _ = upstream_task.await;

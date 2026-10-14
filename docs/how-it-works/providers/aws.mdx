@@ -167,7 +167,7 @@ endpoints:
 - The `sigv4:body` mode buffers at most 10 MiB. Requests with larger bodies are rejected. Use `sigv4:no_body` or `sigv4` (auto-detect) for large payloads.
 - The active provider must contain current `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values. If either becomes unavailable after policy activation, the request fails closed.
 - Signed request fields cannot resolve OpenShell credential placeholders. The proxy strips client-supplied AWS authentication fields and adds trusted SigV4 fields after request rewriting.
-- Requests that select an S3-signed endpoint must already use a canonical path. OpenShell rejects those requests when the path bytes would change through slash collapsing, dot-segment removal, path-parameter stripping, or percent-decoding. Other L7 routes sharing the same host and port keep their normal path canonicalization behavior.
+- OpenShell canonicalizes the request path before policy evaluation, then signs and forwards that same canonical request target. S3 signing uses single percent-encoding without additional path normalization so the signature matches the forwarded target.
 - OpenShell relays only final 2xx responses from a signed request. It drops informational responses and replaces redirects, malformed responses, and 4xx or 5xx response details with a generic error. For 4xx and 5xx responses, it preserves the status code. This prevents AWS signature diagnostics from returning signed credentials to the sandbox.
 
 ## Use from a Sandbox
