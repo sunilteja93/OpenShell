@@ -5679,20 +5679,13 @@ async fn handle_forward_proxy(
     //     strips hop-by-hop `Connection` headers and drops the upstream after
     //     the response instead of asking the upstream to close it.
     hydrate_l7_route(&mut decision);
+    let original_path = path.clone();
     let canonicalize_options = crate::l7::path::CanonicalizeOptions {
         allow_encoded_slash: decision.endpoint.l7_route.as_ref().is_some_and(|route| {
             route
                 .configs
                 .iter()
                 .any(|snapshot| snapshot.config.allow_encoded_slash)
-        }),
-        // The matching path config is selected only after canonicalization.
-        // Fail closed when any candidate signs for S3 so a normalized target
-        // can never be signed as a different object key.
-        reject_path_rewrite: decision.endpoint.l7_route.as_ref().is_some_and(|route| {
-            crate::l7::route_requires_byte_exact_path(
-                route.configs.iter().map(|snapshot| &snapshot.config),
-            )
         }),
         ..Default::default()
     };
@@ -5856,6 +5849,41 @@ async fn handle_forward_proxy(
             None,
             Some(&forward_generation_guard),
         );
+        if let Err(error) = l7_config
+            .config
+            .validate_byte_exact_request_target(&original_path)
+        {
+            if let Some(observer) = endpoint_observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
+            let detail =
+                format!("request-target must be canonical for the selected S3 endpoint: {error}");
+            ocsf_emit!(build_forward_l7_parse_rejection_ocsf_event(
+                workload_addr,
+                method,
+                &host_lc,
+                port,
+                &telemetry_path,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                policy_str,
+                &detail,
+            ));
+            emit_activity_simple(activity_tx, true, "forward_parse_rejection");
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_request_target",
+                    "request-target must be canonical",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         // `canonicalize_options` was built before the matching config was
         // known, so `allow_encoded_slash` was taken permissively across every
         // config on this route. Re-check it against the config that actually
@@ -14996,9 +15024,11 @@ network_policies:
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = listener.local_addr().unwrap().port();
         let target = target.to_string();
+        let (_, target_host, target_port, _) = parse_proxy_uri(&target).expect("valid test target");
+        let host_header = canonical_forward_authority(&target_host, target_port);
         let client = tokio::spawn(async move {
             let mut socket = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
-            let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            let request = format!("GET {target} HTTP/1.1\r\nHost: {host_header}\r\n\r\n");
             socket.write_all(request.as_bytes()).await.unwrap();
             let mut response = Vec::new();
             socket.read_to_end(&mut response).await.unwrap();
@@ -15134,6 +15164,91 @@ network_policies:
             "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"
         );
         assert_eq!(denial_stages, ["ssrf"]);
+    }
+
+    #[tokio::test]
+    async fn forward_s3_byte_exact_paths_are_scoped_after_route_selection() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        for (raw_path, expected_upstream_path) in [
+            ("/api//v1", Some("/api/v1")),
+            ("/api/../bucket/key", None),
+            ("/bucket/../api/v1", Some("/api/v1")),
+        ] {
+            let upstream_listener = TcpListener::bind((upstream_ip, 0))
+                .await
+                .expect("bind test upstream");
+            let upstream_port = upstream_listener.local_addr().unwrap().port();
+            let mut upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream_listener.accept().await.unwrap();
+                let request = read_http_headers(&mut socket).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let endpoint_yaml = format!(
+                r#"      - host: "{upstream_ip}"
+        port: {upstream_port}
+        path: "/api/**"
+        protocol: rest
+        access: full
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+        path: "/bucket/**"
+        protocol: rest
+        access: full
+        credential_signing: sigv4:no_body
+        signing_service: s3
+        signing_region: us-east-1
+"#,
+            );
+            let target = format!("http://{upstream_ip}:{upstream_port}{raw_path}");
+            let (response, _) =
+                Box::pin(drive_forward_through_handler(&endpoint_yaml, &target)).await;
+            let response = String::from_utf8(response).unwrap();
+
+            if let Some(expected_path) = expected_upstream_path {
+                assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+                let forwarded =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut upstream_task)
+                        .await
+                        .expect("unsigned request must reach upstream")
+                        .unwrap();
+                assert!(
+                    forwarded.starts_with(&format!("GET {expected_path} HTTP/1.1")),
+                    "{forwarded}"
+                );
+                let forwarded = forwarded.to_ascii_lowercase();
+                assert!(!forwarded.contains("authorization:"));
+                assert!(!forwarded.contains("x-amz-"));
+            } else {
+                assert!(
+                    response.starts_with("HTTP/1.1 400 Bad Request"),
+                    "{response}"
+                );
+                assert!(response.contains("invalid_request_target"), "{response}");
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        &mut upstream_task,
+                    )
+                    .await
+                    .is_err(),
+                    "selected S3 rejection must happen before upstream connect"
+                );
+                upstream_task.abort();
+                let _ = upstream_task.await;
+            }
+        }
     }
 
     /// A real `tls: skip` policy path through the handler is exempt from the

@@ -115,6 +115,23 @@ impl RestProvider {
             canonicalize_options,
         }
     }
+
+    /// Parse a request while retaining the workload's original request-target.
+    ///
+    /// Route-selected relays need the canonical target to choose a policy
+    /// endpoint, then the original target to apply endpoint-specific byte-exact
+    /// requirements before credentials or upstream I/O are involved.
+    pub(crate) async fn parse_request_with_original_target<C: AsyncRead + Unpin>(
+        &self,
+        client: &mut C,
+    ) -> Result<Option<ParsedHttpRequest>> {
+        parse_http_request_with_original_target(client, &self.canonicalize_options).await
+    }
+}
+
+pub(crate) struct ParsedHttpRequest {
+    pub(crate) request: L7Request,
+    pub(crate) original_target: String,
 }
 
 impl L7Provider for RestProvider {
@@ -198,6 +215,17 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     client: &mut C,
     canonicalize_options: &crate::l7::path::CanonicalizeOptions,
 ) -> Result<Option<L7Request>> {
+    Ok(
+        parse_http_request_with_original_target(client, canonicalize_options)
+            .await?
+            .map(|parsed| parsed.request),
+    )
+}
+
+async fn parse_http_request_with_original_target<C: AsyncRead + Unpin>(
+    client: &mut C,
+    canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+) -> Result<Option<ParsedHttpRequest>> {
     let mut buf = Vec::with_capacity(4096);
 
     loop {
@@ -301,12 +329,15 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
         )?;
     }
 
-    Ok(Some(L7Request {
-        action: method,
-        target: canonical.path,
-        query_params,
-        raw_header: buf, // exact header bytes up to and including \r\n\r\n
-        body_length,
+    Ok(Some(ParsedHttpRequest {
+        request: L7Request {
+            action: method,
+            target: canonical.path,
+            query_params,
+            raw_header: buf, // exact header bytes up to and including \r\n\r\n
+            body_length,
+        },
+        original_target: target,
     }))
 }
 

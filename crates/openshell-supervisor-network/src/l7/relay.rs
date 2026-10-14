@@ -1141,10 +1141,6 @@ where
     let provider =
         crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
             allow_encoded_slash: configs.iter().any(|config| config.allow_encoded_slash),
-            // Route selection happens after parsing. If any candidate is an
-            // S3 signer, fail closed instead of normalizing a path that could
-            // later select a different S3 object key.
-            reject_path_rewrite: crate::l7::route_requires_byte_exact_path(configs),
             ..Default::default()
         });
 
@@ -1159,8 +1155,8 @@ where
             .endpoint_observation_tx
             .as_ref()
             .and_then(EndpointObservationSender::capture);
-        let mut req = match provider.parse_request(client).await {
-            Ok(Some(req)) => req,
+        let parsed = match provider.parse_request_with_original_target(client).await {
+            Ok(Some(parsed)) => parsed,
             Ok(None) => return Ok(()),
             Err(e) => {
                 if is_benign_connection_error(&e) {
@@ -1178,6 +1174,8 @@ where
                 return Ok(());
             }
         };
+        let mut req = parsed.request;
+        let original_target = parsed.original_target;
         if !request_authority_matches_endpoint(&req, ctx) {
             reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
@@ -1212,6 +1210,25 @@ where
             ctx.provider_credential_revision,
             Some(engine.generation_guard()),
         );
+        if let Err(error) = config.validate_byte_exact_request_target(&original_target) {
+            let detail =
+                format!("request-target must be canonical for the selected S3 endpoint: {error}");
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
+            emit_parse_rejection(ctx, &detail, engine_type_for_protocol(config.protocol));
+            crate::l7::rest::RestProvider::default()
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    &detail,
+                    client,
+                    None,
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+                )
+                .await?;
+            return Ok(());
+        }
         // The request was canonicalized before the matching config was known,
         // so `allow_encoded_slash` was taken permissively across every config
         // on this host:port. Re-check it against the config that actually
@@ -8863,6 +8880,150 @@ network_policies:
     binaries:
       - { path: /usr/bin/node }
 "#;
+
+    const S3_PATH_SCOPING_POLICY: &str = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: /api/**
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+      - host: gateway.example.test
+        port: 443
+        path: /bucket/**
+        protocol: rest
+        enforcement: enforce
+        credential_signing: sigv4
+        signing_service: s3
+        signing_region: us-east-1
+        rules:
+          - allow:
+              method: GET
+              path: "/bucket/**"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+
+    async fn relay_mixed_s3_target(target: &str) -> (String, String) {
+        let engine = OpaEngine::from_strings(TEST_POLICY, S3_PATH_SCOPING_POLICY).unwrap();
+        let input = NetworkInput {
+            host: "gateway.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoints, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        let configs: Vec<_> = endpoints
+            .iter()
+            .map(|endpoint| crate::l7::parse_l7_config(endpoint).unwrap())
+            .collect();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let (_, resolver) = SecretResolver::from_provider_env(TestHashMap::from([
+            (
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "test-access-key".to_string(),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "test-secret-key".to_string(),
+            ),
+        ]));
+        let ctx = L7EvalContext {
+            secret_resolver: resolver.map(Arc::new),
+            ..encoded_slash_scoping_ctx()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+        let server = tokio::spawn(async move {
+            let mut forwarded = Vec::new();
+            let mut chunk = [0u8; 512];
+            while let Ok(Ok(count)) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                upstream.read(&mut chunk),
+            )
+            .await
+            {
+                if count == 0 {
+                    break;
+                }
+                forwarded.extend_from_slice(&chunk[..count]);
+                if forwarded.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if !forwarded.is_empty() {
+                upstream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            String::from_utf8(forwarded).unwrap()
+        });
+
+        app.write_all(
+            format!(
+                "GET {target} HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_http_headers(&mut app),
+        )
+        .await
+        .expect("route-selected relay must answer");
+        drop(app);
+
+        let forwarded = server.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("route-selected relay must finish")
+            .unwrap()
+            .unwrap();
+        (String::from_utf8(response).unwrap(), forwarded)
+    }
+
+    #[tokio::test]
+    async fn route_selected_s3_byte_exact_paths_are_scoped_after_selection() {
+        let (response, forwarded) = relay_mixed_s3_target("/api//v1").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(forwarded.starts_with("GET /api/v1 HTTP/1.1"), "{forwarded}");
+        assert!(!forwarded.to_ascii_lowercase().contains("authorization:"));
+
+        let (response, forwarded) = relay_mixed_s3_target("/api/../bucket/key").await;
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(forwarded.is_empty(), "S3 rejection reached upstream");
+
+        let (response, forwarded) = relay_mixed_s3_target("/bucket/../api/v1").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(forwarded.starts_with("GET /api/v1 HTTP/1.1"), "{forwarded}");
+        let forwarded = forwarded.to_ascii_lowercase();
+        assert!(!forwarded.contains("authorization:"));
+        assert!(!forwarded.contains("x-amz-"));
+    }
 
     fn encoded_slash_scoping_configs() -> Vec<L7EndpointConfig> {
         let rest = |path: &str, allow_encoded_slash: bool| L7EndpointConfig {
