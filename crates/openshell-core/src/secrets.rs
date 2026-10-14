@@ -411,24 +411,20 @@ impl SecretResolver {
         }
     }
 
-    /// Return a resolver view that rejects the listed environment keys.
+    /// Return a resolver view that rejects every known credential placeholder.
     ///
-    /// This is used when trusted transforms need a credential internally but
-    /// untrusted request content must not be able to resolve the same key.
+    /// Trusted transforms can keep the original resolver while using this view
+    /// to scan untrusted request content without materializing any secret.
     #[must_use]
-    pub fn with_denied_env_keys(&self, env_keys: &[&str]) -> Self {
+    pub fn without_resolvable_placeholders(&self) -> Self {
         let mut denied_env_keys = self.denied_env_keys.clone();
-        denied_env_keys.extend(env_keys.iter().map(|key| (*key).to_string()));
-        let by_placeholder = self
-            .by_placeholder
-            .iter()
-            .filter(|(placeholder, _)| {
-                placeholder_env_key(placeholder).is_none_or(|key| !denied_env_keys.contains(key))
-            })
-            .map(|(placeholder, secret)| (placeholder.clone(), secret.clone()))
-            .collect();
+        denied_env_keys.extend(
+            self.by_placeholder
+                .keys()
+                .filter_map(|placeholder| placeholder_env_key(placeholder).map(str::to_owned)),
+        );
         Self {
-            by_placeholder,
+            by_placeholder: HashMap::new(),
             denied_env_keys,
             identity_bound_env_keys: self.identity_bound_env_keys.clone(),
             revision_fallback_allowed_revisions: self.revision_fallback_allowed_revisions.clone(),
@@ -1545,11 +1541,12 @@ mod tests {
     }
 
     #[test]
-    fn denied_env_key_view_separates_request_content_from_trusted_resolution() {
-        const SIGNING_KEYS: &[&str] = &[
+    fn non_resolving_view_separates_request_content_from_trusted_resolution() {
+        const ENV_KEYS: &[&str] = &[
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
+            "API_TOKEN",
         ];
         let provider_env: HashMap<String, String> = [
             ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
@@ -1562,7 +1559,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let stable_handles = SIGNING_KEYS
+        let stable_handles = ENV_KEYS
             .iter()
             .enumerate()
             .map(|(index, key)| ((*key).to_string(), format!("{:064x}", index + 1)))
@@ -1591,9 +1588,9 @@ mod tests {
             .flatten(),
         )
         .expect("combined resolver");
-        let request_resolver = resolver.with_denied_env_keys(SIGNING_KEYS);
+        let request_resolver = resolver.without_resolvable_placeholders();
 
-        for key in SIGNING_KEYS {
+        for key in ENV_KEYS {
             assert!(
                 resolver
                     .resolve_current_env_key_checked(key, "trusted-transform")
@@ -1614,31 +1611,24 @@ mod tests {
 
                 let error = request_resolver
                     .rewrite_header_value(&placeholder)
-                    .expect_err("signing key must be unavailable to request content");
+                    .expect_err("credential must be unavailable to request content");
                 assert!(error.is_endpoint_mismatch());
 
                 let basic =
                     base64::engine::general_purpose::STANDARD.encode(format!("user:{placeholder}"));
                 let error = request_resolver
                     .rewrite_header_value(&format!("Basic {basic}"))
-                    .expect_err("signing key must be denied inside Basic authentication");
+                    .expect_err("credential must be denied inside Basic authentication");
                 assert!(error.is_endpoint_mismatch());
 
                 for target in [format!("/{placeholder}"), format!("/?value={placeholder}")] {
                     let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
                     let error = rewrite_http_header_block(raw.as_bytes(), Some(&request_resolver))
-                        .expect_err("signing key must be rejected in request target");
+                        .expect_err("credential must be rejected in request target");
                     assert!(error.is_endpoint_mismatch());
                 }
             }
         }
-
-        assert_eq!(
-            request_resolver
-                .rewrite_header_value(&child_env["API_TOKEN"])
-                .expect("non-signing key lookup"),
-            Some("allowed-value".to_string())
-        );
     }
 
     #[test]

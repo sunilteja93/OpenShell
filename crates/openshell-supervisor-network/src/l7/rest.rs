@@ -48,11 +48,6 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
-pub(crate) const SIGV4_SIGNING_ENV_KEYS: &[&str] = &[
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-];
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
     let chain = openshell_supervisor_middleware::ChainRunner::new(
@@ -950,12 +945,12 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    // The signer may resolve AWS credentials selected by trusted supervisor
-    // code, but workload-controlled request fields must never materialize them.
+    // The signer may resolve credentials selected by trusted supervisor code,
+    // but workload-controlled SigV4 request fields must not materialize secrets.
     let sigv4_request_resolver = if options.credential_signing.is_sigv4() {
         options
             .resolver
-            .map(|resolver| resolver.with_denied_env_keys(SIGV4_SIGNING_ENV_KEYS))
+            .map(SecretResolver::without_resolvable_placeholders)
     } else {
         None
     };
