@@ -18811,40 +18811,217 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisioning_reconcile_waits_for_a_local_workspace_writer() {
+    async fn provisioning_reconcile_skips_a_sandbox_behind_a_workspace_writer() {
+        use crate::persistence::MutationLockKey;
         let runtime = test_runtime(ControlledDriver::new()).await;
+        // Keys are taken in ascending order. With the sandbox key first, the
+        // scan holds X(sandbox) while it waits for S(workspace).
+        let workspace_key = MutationLockKey::Workspace("default").advisory_key();
+        let sandbox_id = (0..1000)
+            .map(|i| format!("sb-ws-writer-{i}"))
+            .find(|id| MutationLockKey::Sandbox(id).advisory_key() < workspace_key)
+            .expect("a sandbox key that sorts before the workspace key");
+        let sandbox_key = MutationLockKey::Sandbox(&sandbox_id).advisory_key();
         runtime
             .store
             .put_message(&sandbox_record(
-                "sb-ws-writer",
+                &sandbox_id,
                 "ws-writer",
                 SandboxPhase::Provisioning,
             ))
             .await
             .unwrap();
+        let now = openshell_core::time::now_ms();
+        runtime.reconcile_provisioning_deadlines(now).await.unwrap();
+
         // Reconcile re-derives configuration from provider and profile
-        // records, so it waits for their writers, which hold X(workspace).
+        // records, so it must not run under their writers, which hold
+        // X(workspace).
         let writer = runtime
             .mutation_guard(MutationScope::Workspace("default"))
             .await
             .unwrap();
-        let mut reconcile = {
+        let reconcile = {
             let runtime = runtime.clone();
-            let now = openshell_core::time::now_ms();
-            tokio::spawn(async move { runtime.reconcile_provisioning_deadlines(now).await })
+            tokio::spawn(async move {
+                runtime
+                    .reconcile_provisioning_deadlines(now + 300_000)
+                    .await
+            })
         };
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut reconcile)
-                .await
-                .is_err(),
-            "provisioning reconcile must wait for the workspace writer"
-        );
-        drop(writer);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.mutation_locks.key_references(sandbox_key) == 0
+                || runtime.mutation_locks.key_references(workspace_key) < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the scan holds the sandbox key and waits for the workspace key");
+
+        // Start, stop, and delete take the sandbox key; they must not wait
+        // for the writer through the scan.
+        let lifecycle = {
+            let runtime = runtime.clone();
+            let sandbox_id = sandbox_id.clone();
+            tokio::spawn(async move { drop(runtime.lock_sandbox_local(&sandbox_id).await) })
+        };
+        tokio::time::timeout(Duration::from_secs(5), lifecycle)
+            .await
+            .expect("a lifecycle lock proceeds while the writer holds the workspace")
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), reconcile)
             .await
-            .expect("provisioning reconcile proceeds once the writer releases")
+            .expect("the scan skips the busy sandbox instead of waiting for the writer")
             .unwrap()
             .unwrap();
+        assert_eq!(runtime.mutation_locks.key_references(sandbox_key), 0);
+        let skipped = runtime
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.phase(), i32::from(SandboxPhase::Provisioning));
+
+        drop(writer);
+        runtime
+            .reconcile_provisioning_deadlines(now + 300_000)
+            .await
+            .unwrap();
+        let expired = runtime
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+    }
+
+    #[tokio::test]
+    async fn provisioning_reconcile_continues_past_a_skipped_sandbox() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        // The scan orders by insert time, then name: the busy sandbox is stored
+        // first and named first, so a skip that ended the pass would leave the
+        // other sandbox alone.
+        let busy = sandbox_record("sb-skip-busy", "a-busy", SandboxPhase::Provisioning);
+        let mut other = sandbox_record("sb-skip-other", "b-other", SandboxPhase::Provisioning);
+        other.metadata.as_mut().unwrap().workspace = "alpha".to_string();
+        runtime.store.put_message(&busy).await.unwrap();
+        runtime.store.put_message(&other).await.unwrap();
+        let now = openshell_core::time::now_ms();
+        runtime.reconcile_provisioning_deadlines(now).await.unwrap();
+
+        let writer = runtime
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
+        // Spawned: the lock-order check forbids nesting under the writer in this task.
+        let reconcile = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .reconcile_provisioning_deadlines(now + 300_000)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reconcile)
+            .await
+            .expect("the scan skips the busy sandbox instead of waiting for the writer")
+            .unwrap()
+            .unwrap();
+        let skipped = runtime
+            .store
+            .get_message::<Sandbox>("sb-skip-busy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.phase(), i32::from(SandboxPhase::Provisioning));
+        let expired = runtime
+            .store
+            .get_message::<Sandbox>("sb-skip-other")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            expired.phase(),
+            i32::from(SandboxPhase::Error),
+            "a skipped sandbox must not end the pass"
+        );
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn provisioning_reconcile_releases_the_workspace_behind_a_busy_sandbox() {
+        use crate::persistence::MutationLockKey;
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        // With the workspace key first, the scan holds S(workspace) while it
+        // waits for X(sandbox), and a provider writer queues behind the scan.
+        let workspace_key = MutationLockKey::Workspace("default").advisory_key();
+        let sandbox_id = (0..1000)
+            .map(|i| format!("sb-busy-{i}"))
+            .find(|id| MutationLockKey::Sandbox(id).advisory_key() > workspace_key)
+            .expect("a sandbox key that sorts after the workspace key");
+        let sandbox_key = MutationLockKey::Sandbox(&sandbox_id).advisory_key();
+        runtime
+            .store
+            .put_message(&sandbox_record(
+                &sandbox_id,
+                "busy",
+                SandboxPhase::Provisioning,
+            ))
+            .await
+            .unwrap();
+        let now = openshell_core::time::now_ms();
+        runtime.reconcile_provisioning_deadlines(now).await.unwrap();
+
+        let lifecycle = runtime.lock_sandbox_local(&sandbox_id).await;
+        let reconcile = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .reconcile_provisioning_deadlines(now + 300_000)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.mutation_locks.key_references(workspace_key) == 0
+                || runtime.mutation_locks.key_references(sandbox_key) < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the scan holds the workspace key and waits for the sandbox key");
+
+        let writer = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                drop(
+                    runtime
+                        .mutation_guard(MutationScope::Workspace("default"))
+                        .await
+                        .unwrap(),
+                );
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("a provider writer proceeds while the sandbox is busy")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reconcile)
+            .await
+            .expect("the scan skips the busy sandbox instead of waiting for it")
+            .unwrap()
+            .unwrap();
+        drop(lifecycle);
+        let skipped = runtime
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.phase(), i32::from(SandboxPhase::Provisioning));
     }
 
     #[tokio::test]

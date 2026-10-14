@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 
 const REPAIR_WINDOW_MS: i64 = 300_000;
 
+/// How long a scan pass waits for one sandbox's local keys before it skips
+/// that sandbox until the next pass. Keys are taken in ascending order, so the
+/// scan can hold X(sandbox) while it waits for S(workspace) behind a provider
+/// or profile writer, and the sandbox's lifecycle operations wait behind the
+/// scan. Well under the mutation lock timeout.
+const SCAN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Opaque identity of a committed effective configuration change. A -> B -> A
 /// must use three different IDs even if the first and last content hashes match.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,9 +476,35 @@ impl super::ComputeRuntime {
             // Expiration can fence Starting while its driver RPC owns the
             // lifecycle gate. Cleanup waits for that gate; Error never waits
             // for compute I/O, matching the existing driver-observation fence.
-            let local_guard = self
-                .lock_sandbox_local_in_workspace(candidate.object_workspace(), &record.id)
-                .await;
+            // A timed-out acquisition releases the keys it already took.
+            let Ok(local_guard) = tokio::time::timeout(
+                SCAN_LOCK_WAIT,
+                self.lock_sandbox_local_in_workspace(candidate.object_workspace(), &record.id),
+            )
+            .await
+            else {
+                // Brief contention is routine; a skip past the deadline
+                // delays expiry, so operators should see it.
+                let overdue = candidate
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.provisioning.as_ref())
+                    .and_then(|record| record.deadline.as_ref())
+                    .and_then(|deadline| timestamp_to_millis(deadline).ok())
+                    .is_some_and(|deadline| deadline <= now_ms);
+                if overdue {
+                    tracing::warn!(
+                        sandbox_id = %record.id,
+                        "Provisioning deadline scan skipped an overdue sandbox whose locks are busy"
+                    );
+                } else {
+                    tracing::debug!(
+                        sandbox_id = %record.id,
+                        "Provisioning deadline scan skipped a sandbox whose locks are busy"
+                    );
+                }
+                continue;
+            };
             let Some(mut current) = self
                 .store
                 .get_message::<Sandbox>(&record.id)
