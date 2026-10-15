@@ -2993,7 +2993,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
             install_fake_forwarding_ssh(&fake_ssh_dir);
             let (endpoint, tls) = (server.endpoint.as_str(), &tls);
             let (forward_port, result) = with_free_forward_port(|spec| async move {
-                run::sandbox_create(
+                Box::pin(run::sandbox_create(
                     endpoint,
                     "openshell",
                     run::SandboxCreateConfig {
@@ -3005,7 +3005,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
                     },
                     "default",
                     tls,
-                )
+                ))
                 .await
             })
             .await;

@@ -1487,14 +1487,13 @@ impl ComputeRuntime {
                     Some(guard) => guard,
                     None => runtime.lock_sandbox_for_lifecycle(&lifecycle_guard).await,
                 };
-                runtime
-                    .compensate_failed_create_inner(
-                        &created,
-                        lifecycle_guard,
-                        sandbox_guard,
-                        original,
-                    )
-                    .await
+                Box::pin(runtime.compensate_failed_create_inner(
+                    &created,
+                    lifecycle_guard,
+                    sandbox_guard,
+                    original,
+                ))
+                .await
             }
             .instrument(request_span),
         )
@@ -4187,7 +4186,8 @@ impl ComputeRuntime {
 
     async fn reconcile_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
+            if let Err(err) = Box::pin(self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD)).await
+            {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
             tokio::select! {
@@ -4199,7 +4199,7 @@ impl ComputeRuntime {
 
     async fn restart_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.restart_due_sandboxes().await {
+            if let Err(err) = Box::pin(self.restart_due_sandboxes()).await {
                 warn!(error = %err, "Sandbox restart sweep failed");
             }
             tokio::select! {
@@ -4742,7 +4742,8 @@ impl ComputeRuntime {
                 continue;
             }
 
-            self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms)
+            // Boxed so this sweep's future stays small for its callers.
+            Box::pin(self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms))
                 .await
                 .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
         }
@@ -4836,7 +4837,8 @@ impl ComputeRuntime {
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
         if existing_phase != SandboxPhase::Starting && !ready_container_exit {
-            return self.apply_sandbox_update_locked(incoming, existing).await;
+            // Boxed so this update's future stays small for its callers.
+            return Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await;
         }
 
         // Any snapshot can already be queued when StartSandbox moves the
@@ -4885,7 +4887,7 @@ impl ComputeRuntime {
             Ok(Some(_) | None) | Err(_) => {}
         }
 
-        self.apply_sandbox_update_locked(incoming, existing).await
+        Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await
     }
 
     async fn apply_sandbox_update_locked(
@@ -10270,7 +10272,7 @@ mod tests {
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.restart_due_sandboxes().await.unwrap();
+        Box::pin(runtime.restart_due_sandboxes()).await.unwrap();
 
         assert_eq!(driver.stop_calls(), 1);
         assert_eq!(driver.start_calls(), 1);
@@ -14099,7 +14101,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            runtime.reconcile_store_with_backend(Duration::ZERO),
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO)),
         )
         .await
         .expect("prune sweep blocked on the stuck driver delete call")
