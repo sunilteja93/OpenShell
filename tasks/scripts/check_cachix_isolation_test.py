@@ -4,9 +4,11 @@
 """Guard the checked-in credential boundary; GitHub environment rules are external."""
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,8 +44,7 @@ def test_shared_nix_setup_only_reads_the_cache():
     assert "cachix-auth-token" not in setup.get("inputs", {})
 
 
-def test_cache_writer_uses_only_the_main_push_revision():
-    writer = load_yaml(WRITER)
+def check_cache_writer(writer: dict) -> None:
     assert writer["on"] == {"push": {"branches": ["main"]}}
     assert writer["permissions"] == {"contents": "read"}
     assert set(writer["jobs"]) == {"populate"}
@@ -59,23 +60,69 @@ def test_cache_writer_uses_only_the_main_push_revision():
         {"system": "aarch64-linux", "runner": "ubuntu-24.04-arm"},
         {"system": "aarch64-darwin", "runner": "macos-15-xlarge"},
     ]
-    # No PR artifacts, local actions or caller-supplied source enter this job.
-    actions = {
-        step["uses"].split("@")[0]: step for step in job["steps"] if "uses" in step
-    }
-    assert set(actions) == {
+    # Review any new step in this credential-bearing job. Preserve order and
+    # duplicates: a later main checkout must not hide an earlier candidate build.
+    steps = job["steps"]
+    assert [step.get("uses", "run").split("@")[0] for step in steps] == [
+        "run",
         "actions/checkout",
         "DeterminateSystems/determinate-nix-action",
         "cachix/cachix-action",
-    }
-    assert actions["actions/checkout"]["with"] == {
+        "run",
+    ]
+    credential, checkout, install_nix, cache, build = steps
+    assert "run" in credential and "run" in build
+    for step in (checkout, install_nix, cache):
+        assert re.fullmatch(r"[0-9a-f]{40}", step["uses"].partition("@")[2])
+    assert checkout["with"] == {
         "persist-credentials": "false",
         "ref": "${{ github.sha }}",
     }
-    assert actions["cachix/cachix-action"]["with"] == {
+    assert cache["with"] == {
         "name": "openshell",
         "authToken": "${{ secrets.CACHIX_WRITE_TOKEN }}",
     }
+
+
+def test_cache_writer_uses_only_the_main_push_revision():
+    check_cache_writer(load_yaml(WRITER))
+
+
+def test_cache_writer_rejects_candidate_checkout_followed_by_main_restore():
+    writer = load_yaml(WRITER)
+    steps = writer["jobs"]["populate"]["steps"]
+    checkout = steps[1]
+    candidate_checkout = {
+        **checkout,
+        "with": {**checkout["with"], "ref": "refs/pull/123/head"},
+    }
+    steps.insert(-1, candidate_checkout)
+    steps.append(checkout)
+
+    with pytest.raises(AssertionError):
+        check_cache_writer(writer)
+
+
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    [(1, 4), (4, 1)],
+    ids=["checkout-after-build", "build-before-checkout"],
+)
+def test_cache_writer_rejects_reordered_steps(source: int, destination: int):
+    writer = load_yaml(WRITER)
+    steps = writer["jobs"]["populate"]["steps"]
+    steps.insert(destination, steps.pop(source))
+
+    with pytest.raises(AssertionError):
+        check_cache_writer(writer)
+
+
+def test_cache_writer_rejects_mutable_action_refs():
+    writer = load_yaml(WRITER)
+    writer["jobs"]["populate"]["steps"][1]["uses"] = "actions/checkout@main"
+
+    with pytest.raises(AssertionError):
+        check_cache_writer(writer)
 
 
 def test_cache_writer_requires_its_environment_credential():
