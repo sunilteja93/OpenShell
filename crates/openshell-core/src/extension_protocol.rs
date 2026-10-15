@@ -19,6 +19,9 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// configured signer before accepting sandbox creation.
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
+/// Optional stopped-state image updates retaining the resource and its storage.
+pub const COMPUTE_UPDATE_SANDBOX_IMAGE: &str = "openshell.compute.update-sandbox-image";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -121,6 +124,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let mut supported_capabilities = vec![contract.clone()];
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_IMAGE.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {

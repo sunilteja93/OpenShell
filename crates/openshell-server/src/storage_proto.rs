@@ -154,12 +154,16 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Image updates add a public-only request and a durable optional pending
+    // intent plus monotonic image revision. Their new fields follow the existing
+    // token-grant observation without reusing its wire tag. Legacy sandboxes
+    // decode absent/zero; revisions fence delayed driver retries after success.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "cc06b38c9ecb4c6518e0d4963f40c4f16f992483ce111c7b23cbcb729db946ea";
+        "2d82067143395b08928e848832111370d56fa4c6e3691f0fa1d2dc32928832aa";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
+        "f435fc91632084aef0eb17958fc963f4a90f2f0b54f4de67042b33bb9cbfd135";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "9997e51420f29542cefd99d394e211a8e5a21967f4f0fb9ac94aaf598a821b11";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -570,12 +574,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            105 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -583,7 +587,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -627,15 +631,26 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (314, 28),
-                (95, 22),
-                (83, 22),
+                (316, 28),
+                (96, 22),
+                (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
             ),
             "the public/durable schema inventory changed; review API and storage ownership, preserve prior-payload decoding, and update the reviewed fingerprints"
         );
+    }
+
+    #[test]
+    fn pre_image_update_sandbox_has_no_pending_image_intent() {
+        let sandbox = openshell_core::proto::Sandbox::decode(
+            legacy_bytes(SANDBOX_WITHOUT_ENDPOINT_STATUS).as_slice(),
+        )
+        .expect("legacy sandbox must remain decodable");
+        let status = sandbox.status.unwrap();
+        assert!(status.image_update.is_none());
+        assert_eq!(status.image_revision, 0);
     }
 
     #[test]

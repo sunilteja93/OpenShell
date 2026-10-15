@@ -4,6 +4,7 @@
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
 pub mod driver_config;
+mod image_update;
 pub mod lease;
 mod mutation_guard;
 pub mod provisioning_deadline;
@@ -581,6 +582,17 @@ impl RemoteComputeDriver {
 
 #[tonic::async_trait]
 impl ComputeDriver for RemoteComputeDriver {
+    async fn update_sandbox_image(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
+        Status,
+    > {
+        self.verify_admission_policy().await?;
+        self.client().update_sandbox_image(request).await
+    }
+
     type WatchSandboxesStream = DriverWatchStream;
 
     async fn get_capabilities(
@@ -1487,14 +1499,15 @@ impl ComputeRuntime {
                     Some(guard) => guard,
                     None => runtime.lock_sandbox_for_lifecycle(&lifecycle_guard).await,
                 };
-                runtime
-                    .compensate_failed_create_inner(
-                        &created,
-                        lifecycle_guard,
-                        sandbox_guard,
-                        original,
-                    )
-                    .await
+                // Keep compensation's future bounded as the persisted sandbox
+                // status grows (including image-update reconciliation state).
+                Box::pin(runtime.compensate_failed_create_inner(
+                    &created,
+                    lifecycle_guard,
+                    sandbox_guard,
+                    original,
+                ))
+                .await
             }
             .instrument(request_span),
         )
@@ -1679,12 +1692,22 @@ impl ComputeRuntime {
                 return Ok(current);
             }
             let automatic_restart = is_automatic_restart_transition(&current);
-            // Timeout cleanup owns reclamation while the record remains Error.
-            // Its later start may recreate missing compute; an ordinary stop must
-            // not replace that recovery state with Stopping or Stopped.
-            if phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current) {
+            // A timed-out attempt owns reclamation until both its driver work
+            // has settled (checked above) and cleanup has completed. Once those
+            // durable facts hold, explicit stop can expose a safe Stopped state
+            // for image repair without stopping/deleting retained compute again.
+            // Keep the timeout record: Start still needs its recovery provenance.
+            let reclaimed_timeout =
+                phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current);
+            if reclaimed_timeout
+                && current
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.provisioning.as_ref())
+                    .is_none_or(|record| record.cleanup_completed_time.is_none())
+            {
                 return Err(Status::failed_precondition(
-                    "sandbox provisioning timed out; retry start after timeout cleanup completes",
+                    "sandbox provisioning timed out; wait for timeout cleanup before stop or start",
                 ));
             }
             // Error does not prove compute has stopped. Use the normal driver stop
@@ -1706,18 +1729,28 @@ impl ComputeRuntime {
                 break (current.clone(), current);
             }
 
-            match self
-                .write_lifecycle_phase(
-                    &current,
-                    SandboxPhase::Stopping,
-                    "Stopping",
-                    "Sandbox stop requested",
+            let (next_phase, reason, message) = if reclaimed_timeout {
+                (
+                    SandboxPhase::Stopped,
+                    "StoppedAfterProvisioningTimeout",
+                    "Timed-out compute has been reclaimed; sandbox stopped for repair",
                 )
+            } else {
+                (SandboxPhase::Stopping, "Stopping", "Sandbox stop requested")
+            };
+            match self
+                .write_lifecycle_phase(&current, next_phase, reason, message)
                 .await
             {
                 Ok(stopping) => {
                     self.sandbox_index.update_from_sandbox(&stopping);
                     self.sandbox_watch_bus.notify(&sandbox_id);
+                    if reclaimed_timeout {
+                        self.cleanup_stopped_sandbox_sessions(&stopping)
+                            .await
+                            .map_err(Status::internal)?;
+                        return Ok(stopping);
+                    }
                     break (current, stopping);
                 }
                 Err(crate::persistence::PersistenceError::Conflict { .. })
@@ -1848,6 +1881,7 @@ impl ComputeRuntime {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         provisioning_operation::ensure_operation_settled(&candidate)?;
+        image_update::ensure_no_pending_image_update(&candidate)?;
         if provisioning_deadline::timed_out(&candidate)
             && candidate
                 .status
@@ -1885,6 +1919,7 @@ impl ComputeRuntime {
         let mut attempts = 0;
         let (previous, starting, launch_authentication) = loop {
             provisioning_operation::ensure_operation_settled(&current)?;
+            image_update::ensure_no_pending_image_update(&current)?;
             let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
             if phase == SandboxPhase::Ready {
                 return Ok(current);
@@ -6702,6 +6737,8 @@ fn public_status_from_driver(
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
+        image_update: None,
+        image_revision: 0,
     }
 }
 
@@ -6777,6 +6814,8 @@ fn apply_driver_snapshot(
         new_status.restart_count = old_status.restart_count;
         new_status.next_restart_time = old_status.next_restart_time;
         new_status.main_process_started_time = old_status.main_process_started_time;
+        new_status.image_update.clone_from(&old_status.image_update);
+        new_status.image_revision = old_status.image_revision;
     }
 
     phase = match old_phase {
@@ -7376,6 +7415,18 @@ impl Default for NoopTestDriver {
 #[cfg(any(test, feature = "test-support"))]
 #[tonic::async_trait]
 impl ComputeDriver for NoopTestDriver {
+    async fn update_sandbox_image(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "storage-preserving image updates are not supported by this driver",
+        ))
+    }
+
     async fn authenticate_sandbox(
         &self,
         _request: Request<AuthenticateSandboxRequest>,
@@ -7999,6 +8050,18 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for TestDriver {
+        async fn update_sandbox_image(
+            &self,
+            _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented(
+                "storage-preserving image updates are not supported by this driver",
+            ))
+        }
+
         async fn authenticate_sandbox(
             &self,
             _request: Request<AuthenticateSandboxRequest>,
@@ -8415,6 +8478,18 @@ mod tests {
 
     #[tonic::async_trait]
     impl ComputeDriver for ControlledDriver {
+        async fn update_sandbox_image(
+            &self,
+            _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented(
+                "storage-preserving image updates are not supported by this driver",
+            ))
+        }
+
         async fn authenticate_sandbox(
             &self,
             _request: Request<AuthenticateSandboxRequest>,
@@ -11674,6 +11749,18 @@ mod tests {
 
         #[tonic::async_trait]
         impl ComputeDriver for FailingDriver {
+            async fn update_sandbox_image(
+                &self,
+                _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
+                Status,
+            > {
+                Err(Status::unimplemented(
+                    "storage-preserving image updates are not supported by this driver",
+                ))
+            }
+
             async fn authenticate_sandbox(
                 &self,
                 _request: Request<AuthenticateSandboxRequest>,
@@ -14110,7 +14197,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            runtime.reconcile_store_with_backend(Duration::ZERO),
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO)),
         )
         .await
         .expect("prune sweep blocked on the stuck driver delete call")

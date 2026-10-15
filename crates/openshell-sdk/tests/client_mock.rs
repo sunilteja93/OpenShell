@@ -234,6 +234,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn update_sandbox(
+        &self,
+        _request: tonic::Request<proto::UpdateSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        Err(Status::unimplemented("not implemented by test service"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<proto::ReportProviderReadinessRequest>,
