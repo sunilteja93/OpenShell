@@ -95,8 +95,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-vm-driver:
     needs: [compute-versions, build-binaries]
@@ -107,8 +105,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   package-binaries:
     needs: [compute-versions, build-binaries, build-vm-driver]
@@ -146,7 +142,6 @@ jobs:
       is-prerelease: ${{ needs.compute-versions.outputs.is_prerelease == 'true' }}
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-python-wheel:
     name: Build Python Wheel

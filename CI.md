@@ -17,6 +17,41 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### Nix cache access
+
+PR, merge-group, scan, and release jobs read the public `openshell` Cachix cache
+without a write credential. The shared `setup-nix` action always disables uploads.
+`Populate Nix Cache` populates the default development shell and VM runtime for
+Linux x86-64, Linux ARM64, and macOS ARM64 after pushes to `main`. It checks out
+the triggering commit on fresh GitHub-hosted runners and uses the `cachix-write`
+environment. Cache misses still build locally; cache population is independent
+of the release and PR gates.
+
+Before enabling cache writes, a repository administrator must:
+
+1. Revoke the old Cachix write token and remove `CACHIX_AUTH_TOKEN` from
+   repository secrets and organization secrets available to this repository.
+   Audit cache uploads made with that token and invalidate untrusted entries.
+2. Create the `cachix-write` environment. Under **Deployment branches and tags**,
+   choose **Selected branches and tags** and allow only the exact branch `main`,
+   with no tag rules. Protect `main` from unreviewed changes and disable
+   administrator bypass of the environment rules.
+3. Only after those restrictions are saved, add a new, `openshell`-scoped Cachix
+   write token as the environment secret `CACHIX_WRITE_TOKEN`. Neither token
+   name may hold a write credential at repository or organization scope. Keep
+   cache writes disabled until this migration is complete.
+
+These settings are part of the security boundary. Mirrored PRs can change
+workflow YAML, so a workflow condition cannot protect a repository secret.
+GitHub enforces [environment branch restrictions](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+outside that YAML. A workflow referencing a nonexistent environment creates it
+without protection rules; the workflow does not configure these restrictions.
+The cache writer fails if its environment credential is missing. This isolation
+applies to Cachix; other CI credentials need their own access controls.
+
+Run `mise run test:cachix-isolation` to check the workflow wiring locally.
+The test does not verify live environment settings or token permissions.
+
 ### Protobuf API compatibility
 
 `Protobuf Compatibility` runs in Branch Checks and Release Tag through the shared
@@ -311,8 +346,6 @@ jobs:
         ${{ needs.build.outputs.sandbox_image }}
       charts: ${{ needs.build.outputs.chart_ref }}
       fail-on-static-findings: true
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
@@ -332,7 +365,7 @@ The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
 
-`CACHIX_AUTH_TOKEN` is optional. The parent publishes SARIF from CodeQL, Trivy,
+The scan workflows use read-only Nix cache access. The parent publishes SARIF from CodeQL, Trivy,
 and workflow reports against the candidate tag and commit. Existing standalone
 triggers stay active.
 
@@ -554,7 +587,8 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
-| `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
+| `.github/actions/setup-nix/action.yml` | Installs Nix and configures read-only access to the OpenShell Cachix cache. |
+| `.github/workflows/cachix.yml` | Populates the Nix cache from `main` using the protected `cachix-write` environment. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
