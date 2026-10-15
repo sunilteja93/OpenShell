@@ -337,6 +337,8 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies |
+| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
@@ -382,7 +384,7 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Release Dev publishes the `dev` docs version from `main`. Release publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
+Release Dev publishes the `dev` docs version from `main`. Release Tag publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
 `docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 

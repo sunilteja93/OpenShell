@@ -1487,14 +1487,13 @@ impl ComputeRuntime {
                     Some(guard) => guard,
                     None => runtime.lock_sandbox_for_lifecycle(&lifecycle_guard).await,
                 };
-                runtime
-                    .compensate_failed_create_inner(
-                        &created,
-                        lifecycle_guard,
-                        sandbox_guard,
-                        original,
-                    )
-                    .await
+                Box::pin(runtime.compensate_failed_create_inner(
+                    &created,
+                    lifecycle_guard,
+                    sandbox_guard,
+                    original,
+                ))
+                .await
             }
             .instrument(request_span),
         )
@@ -4187,7 +4186,8 @@ impl ComputeRuntime {
 
     async fn reconcile_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
+            if let Err(err) = Box::pin(self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD)).await
+            {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
             tokio::select! {
@@ -4199,7 +4199,7 @@ impl ComputeRuntime {
 
     async fn restart_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            if let Err(err) = self.restart_due_sandboxes().await {
+            if let Err(err) = Box::pin(self.restart_due_sandboxes()).await {
                 warn!(error = %err, "Sandbox restart sweep failed");
             }
             tokio::select! {
@@ -4742,7 +4742,8 @@ impl ComputeRuntime {
                 continue;
             }
 
-            self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms)
+            // Boxed so this sweep's future stays small for its callers.
+            Box::pin(self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms))
                 .await
                 .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
         }
@@ -4836,7 +4837,8 @@ impl ComputeRuntime {
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
         if existing_phase != SandboxPhase::Starting && !ready_container_exit {
-            return self.apply_sandbox_update_locked(incoming, existing).await;
+            // Boxed so this update's future stays small for its callers.
+            return Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await;
         }
 
         // Any snapshot can already be queued when StartSandbox moves the
@@ -4885,7 +4887,7 @@ impl ComputeRuntime {
             Ok(Some(_) | None) | Err(_) => {}
         }
 
-        self.apply_sandbox_update_locked(incoming, existing).await
+        Box::pin(self.apply_sandbox_update_locked(incoming, existing)).await
     }
 
     async fn apply_sandbox_update_locked(
@@ -6701,7 +6703,6 @@ fn public_status_from_driver(
         restart_count: 0,
         next_restart_time: None,
         main_process_started_time: None,
-        last_token_grant_failure: None,
     }
 }
 
@@ -6836,9 +6837,6 @@ fn apply_driver_snapshot(
     }
 
     if let (Some(status), Some(current_status)) = (status.as_mut(), sandbox.status.as_ref()) {
-        status
-            .last_token_grant_failure
-            .clone_from(&current_status.last_token_grant_failure);
         status
             .main_process_instance_id
             .clone_from(&current_status.main_process_instance_id);
@@ -10274,7 +10272,7 @@ mod tests {
         });
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.restart_due_sandboxes().await.unwrap();
+        Box::pin(runtime.restart_due_sandboxes()).await.unwrap();
 
         assert_eq!(driver.stop_calls(), 1);
         assert_eq!(driver.start_calls(), 1);
@@ -11157,16 +11155,10 @@ mod tests {
             path: "/mcp".to_string(),
             last_result: openshell_core::proto::EndpointResult::TransportFailed as i32,
             last_reported_time: Some("2026-09-05T01:01:00.000Z".parse().unwrap()),
-            last_failure: None,
         };
-        let grant_failure = Box::new(openshell_core::proto::TokenGrantFailureObservation {
-            destination_host: "api.example.com".to_string(),
-            ..Default::default()
-        });
         sandbox.status = Some(SandboxStatus {
             phase: SandboxPhase::Ready as i32,
             endpoint_statuses: vec![endpoint.clone()],
-            last_token_grant_failure: Some(grant_failure.clone()),
             ..Default::default()
         });
         let incoming = ready_driver_sandbox("sandbox-id", "sandbox-name");
@@ -11176,7 +11168,6 @@ mod tests {
         assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
         let status = sandbox.status.expect("driver status applied");
         assert_eq!(status.endpoint_statuses, vec![endpoint]);
-        assert_eq!(status.last_token_grant_failure, Some(grant_failure));
         assert!(
             status
                 .conditions
@@ -14110,7 +14101,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            runtime.reconcile_store_with_backend(Duration::ZERO),
+            Box::pin(runtime.reconcile_store_with_backend(Duration::ZERO)),
         )
         .await
         .expect("prune sweep blocked on the stuck driver delete call")

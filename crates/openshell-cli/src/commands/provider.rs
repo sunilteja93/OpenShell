@@ -2118,7 +2118,7 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     )
 }
 
-pub fn provider_refresh_recovery_action_name(
+fn provider_refresh_recovery_action_name(
     action: ProviderCredentialRefreshRecoveryAction,
 ) -> &'static str {
     match action {

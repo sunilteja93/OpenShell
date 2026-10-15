@@ -20,8 +20,7 @@ pub(super) use endpoint_status::{
     handle_peer_report_endpoint_status, handle_report_endpoint_status,
 };
 pub use endpoint_status::{
-    invalidate_endpoint_status_on_startup, invalidate_endpoint_status_without_session,
-    reset_endpoint_status_for_supervisor_session,
+    invalidate_endpoint_status_on_startup, reset_endpoint_status_for_supervisor_session,
     retry_endpoint_status_after_supervisor_disconnect,
 };
 
@@ -3461,7 +3460,11 @@ fn canonical_endpoint_path(path: &str) -> String {
 }
 
 pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = false;
             endpoint.token_grant_owner.clear();
@@ -3473,7 +3476,11 @@ fn stamp_provider_credentialed_endpoints(
     policy: &mut ProtoSandboxPolicy,
     scopes: &[CredentialedEndpointScope],
 ) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = scopes
                 .iter()
@@ -3959,6 +3966,14 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
+            // A global policy replaces every sandbox's policy, and a sandbox
+            // cannot switch formats after it starts, so a Cedar global policy
+            // would be rejected by every YAML sandbox.
+            if !new_policy.cedar_policy_source.is_empty() {
+                return Err(Status::invalid_argument(
+                    "global policies must be YAML; Cedar policies can only be set per sandbox",
+                ));
+            }
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
@@ -5018,9 +5033,10 @@ pub(super) async fn handle_report_policy_status(
                 |sandbox| {
                     sandbox.set_current_policy_version(version_to_set);
                     if let Some(endpoints) = &endpoint_reset {
-                        endpoint_status::reset_endpoint_statuses(
+                        endpoint_status::reconcile_endpoint_statuses(
                             sandbox,
                             endpoints,
+                            &HashSet::new(),
                             &prost_types::Timestamp::default(),
                         );
                     }
@@ -5955,7 +5971,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
-    let result = handle_approve_all_draft_chunks_inner(state, request).await;
+    let result = Box::pin(handle_approve_all_draft_chunks_inner(state, request)).await;
     if result.is_err() {
         emit_policy_decision_failure(PolicyDecisionOperation::ApproveAll, 0);
     }
@@ -12299,6 +12315,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_config_delivers_provider_rules_separately_for_a_cedar_policy() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-provider",
+                "cedar-provider",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-cedar-provider").await;
+
+        assert!(
+            effective_policy.network_policies.is_empty(),
+            "provider rules must not be composed into a Cedar policy"
+        );
+        let rule = effective_policy
+            .provider_credential_rules
+            .get("_provider_work_github")
+            .expect("provider rules travel in provider_credential_rules");
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.provider_credentialed),
+            "credentialed endpoints must be stamped"
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
         use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
@@ -13494,6 +13560,63 @@ mod tests {
                 .files
                 .get("/run/openshell/providers/work-config/client.toml"),
             Some(&"endpoint = 'https://config.example'".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_delivers_bound_credentials_to_a_cedar_sandbox() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-env",
+                "cedar-env",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-cedar-env".to_string(),
+                supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
+            })),
+        )
+        .await
+        .expect("provider environment must resolve for a Cedar sandbox")
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        let binding = response
+            .static_credential_bindings
+            .get("GITHUB_TOKEN")
+            .expect("credential must stay bound to the provider's endpoints");
+        assert!(
+            binding
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
         );
     }
 
@@ -15289,7 +15412,7 @@ mod tests {
             chunks.push(chunk);
         }
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -15305,7 +15428,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15425,7 +15548,7 @@ mod tests {
         .map(Option::unwrap)
         .collect::<Vec<_>>();
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -15441,7 +15564,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15626,7 +15749,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -15640,7 +15763,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15657,7 +15780,7 @@ mod tests {
             "pending"
         );
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -15671,7 +15794,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15782,7 +15905,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -15792,7 +15915,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -15849,7 +15972,7 @@ mod tests {
             .await
             .unwrap();
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -15859,7 +15982,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -21740,6 +21863,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_global_policy_rejects_cedar_policy() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(ProtoSandboxPolicy {
+                    version: 1,
+                    cedar_policy_source: "permit(principal, \
+                        action == Sandbox::Action::\"NetworkConnect\", \
+                        resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                        .to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a Cedar global policy must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Cedar"), "{}", err.message());
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_reserved_provider_key() {
         let state = test_server_state().await;
 
@@ -24447,7 +24595,7 @@ mod tests {
             err.code()
         );
 
-        let err = handle_approve_all_draft_chunks(
+        let err = Box::pin(handle_approve_all_draft_chunks(
             &state,
             non_member_request(ApproveAllDraftChunksRequest {
                 sandbox: ("any").to_string(),
@@ -24456,7 +24604,7 @@ mod tests {
                 )),
                 ..Default::default()
             }),
-        )
+        ))
         .await
         .unwrap_err();
         assert_eq!(

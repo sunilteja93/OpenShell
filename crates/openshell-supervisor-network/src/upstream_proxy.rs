@@ -219,8 +219,12 @@ impl NoProxy {
     /// outside that range.
     ///
     /// The automatic loopback bypass is derived from resolved addresses, never
-    /// from the host string. This keeps the bypass valid even for callers whose
-    /// independently IP-constrained resolution may honor sandbox `/etc/hosts`.
+    /// from the host string: `resolved` may come from the sandbox's own
+    /// `/etc/hosts` (see `resolve_socket_addrs`), which the workload controls,
+    /// so treating the name `localhost` as proof of loopback would let a
+    /// spoofed mapping dial a policy-allowed public address while escaping the
+    /// operator proxy. A spoofed `localhost` falls through to the entries below
+    /// and is proxied unless an explicit `NO_PROXY` entry matches.
     fn direct_addrs(
         &self,
         host: &str,
@@ -1778,10 +1782,11 @@ mod tests {
         assert!(!bypasses(&cfg, "example.com"));
     }
 
-    /// Only genuinely loopback resolved addresses may authorize the automatic
-    /// direct-dial bypass. Callers with independently IP-constrained resolution
-    /// can still honor sandbox `/etc/hosts`, so this check must remain based on
-    /// the resolved address rather than the hostname.
+    /// A sandbox controls its own `/etc/hosts`, and `resolve_socket_addrs`
+    /// consults it before DNS, so `localhost` can resolve to any address the
+    /// network policy happens to allow. The name must not authorize a direct
+    /// dial that escapes the operator proxy — only genuinely loopback
+    /// resolved addresses may.
     #[test]
     fn spoofed_localhost_resolution_does_not_bypass_proxy() {
         let cfg = config_ok(&[(HTTPS_PROXY, "http://proxy:8080")]);

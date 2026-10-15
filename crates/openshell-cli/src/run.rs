@@ -443,6 +443,7 @@ pub struct SandboxCreateConfig<'a> {
     pub editor: Option<Editor>,
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
+    pub middleware: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
     pub expose: Option<u16>,
     pub expose_authorization_mode: ServiceAuthorizationMode,
@@ -473,6 +474,7 @@ impl Default for SandboxCreateConfig<'_> {
             editor: None,
             providers: &[],
             policy: None,
+            middleware: None,
             forward: None,
             expose: None,
             expose_authorization_mode: ServiceAuthorizationMode::Strip,
@@ -511,6 +513,7 @@ pub async fn sandbox_create(
         editor,
         providers,
         policy,
+        middleware,
         forward,
         expose,
         expose_authorization_mode,
@@ -614,7 +617,7 @@ pub async fn sandbox_create(
         ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
             .await?;
 
-    let policy = load_sandbox_policy(policy)?;
+    let policy = load_sandbox_policy_with_middleware(policy, middleware)?;
     let resource_limits = if template.is_none() {
         build_sandbox_resource_limits(cpu, memory)?
     } else {
@@ -1519,13 +1522,103 @@ fn merge_rootfs_tar_driver_config(
     Ok(config)
 }
 
-/// Load sandbox policy YAML.
+/// Load a sandbox policy file, YAML or Cedar.
 ///
 /// Resolution order: `--policy` flag > `OPENSHELL_SANDBOX_POLICY` env var.
 /// Returns `None` when no policy source is configured, allowing the server
-/// to apply its own default.
+/// to apply its own default. A Cedar policy's load-time warnings are printed
+/// to stderr; they never fail the load.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    openshell_policy::load_sandbox_policy(cli_path)
+    let policy = openshell_policy::load_sandbox_policy(cli_path)?;
+    if let Some(policy) = &policy {
+        for warning in cedar_policy_warning_lines(policy) {
+            eprintln!("{} {warning}", "warning:".yellow().bold());
+        }
+    }
+    Ok(policy)
+}
+
+/// The load-time warnings of a policy's Cedar source, if it has one.
+fn cedar_policy_warning_lines(policy: &SandboxPolicy) -> Vec<String> {
+    if policy.cedar_policy_source.is_empty() {
+        return Vec::new();
+    }
+    openshell_policy::cedar_policy_warnings(&policy.cedar_policy_source)
+}
+
+/// Renders a policy for `policy get`.
+///
+/// A YAML policy renders as YAML. A Cedar policy renders as its Cedar text,
+/// followed by its middleware, endpoint settings, and process identity as a
+/// separate section, since they are configuration supplied with
+/// `--middleware` rather than part of the policy.
+/// When present (the `--full` view), the gateway-managed provider rules follow
+/// in a section of their own; they supply credential settings and grant no
+/// access.
+fn render_policy_text(policy: &SandboxPolicy) -> Result<String> {
+    let mut text = openshell_policy::serialize_sandbox_policy(policy)
+        .wrap_err("failed to serialize policy")?;
+    if policy.cedar_policy_source.is_empty() {
+        return Ok(text);
+    }
+    if let Some(middleware) = openshell_policy::serialize_network_middlewares(policy)
+        .wrap_err("failed to serialize middleware")?
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(
+            "---\n# Middleware, endpoint settings, and process identity (set with --middleware)\n",
+        );
+        text.push_str(&middleware);
+    }
+    if let Some(rules) = openshell_policy::serialize_provider_credential_rules(policy)
+        .wrap_err("failed to serialize provider credential rules")?
+    {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(
+            "---\n# Provider credential rules (managed by the gateway; they grant no access)\n",
+        );
+        text.push_str(&rules);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    Ok(text)
+}
+
+/// The files `policy set` reads: a policy file and an optional middleware file.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyFiles<'a> {
+    /// Path to a YAML or `.cedar` policy file.
+    pub policy: &'a str,
+    /// Path to a middleware file, if any.
+    pub middleware: Option<&'a str>,
+}
+
+impl PolicyFiles<'_> {
+    /// Loads the policy and adds the middleware file, if any.
+    fn load(self) -> Result<SandboxPolicy> {
+        load_sandbox_policy_with_middleware(Some(self.policy), self.middleware)?
+            .ok_or_else(|| miette::miette!("No policy loaded from {}", self.policy))
+    }
+}
+
+/// Loads the policy and adds the middleware from `middleware_path`, if given.
+fn load_sandbox_policy_with_middleware(
+    policy_path: Option<&str>,
+    middleware_path: Option<&str>,
+) -> Result<Option<SandboxPolicy>> {
+    let mut policy = load_sandbox_policy(policy_path)?;
+    if let Some(middleware_path) = middleware_path {
+        let policy = policy.as_mut().ok_or_else(|| {
+            miette::miette!("--middleware requires a policy (--policy or OPENSHELL_SANDBOX_POLICY)")
+        })?;
+        openshell_policy::apply_middleware_file(policy, Path::new(middleware_path))?;
+    }
+    Ok(policy)
 }
 
 /// Sync files to or from a sandbox.
@@ -1806,17 +1899,6 @@ where
         println!(
             "    Results come from observed MCP over HTTP traffic. They do not check current availability or tool-call success."
         );
-    }
-
-    if let Some(observation) = sandbox
-        .status
-        .as_ref()
-        .and_then(|status| status.last_token_grant_failure.as_deref())
-    {
-        println!("  {}", "Last token grant failure:".dimmed());
-        for line in token_grant_failure_display_lines(observation) {
-            println!("    {line}");
-        }
     }
 
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
@@ -3048,22 +3130,10 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                     "path": endpoint.path,
                     "last_result": endpoint_result_name(endpoint.last_result()),
                     "last_reported_at": endpoint.last_reported_time.as_ref().map(ToString::to_string).unwrap_or_default(),
-                    "last_failure": endpoint.last_failure.as_ref().map(endpoint_failure_to_json),
                 })
             })
             .collect::<Vec<_>>()
     });
-    let last_token_grant_failure = sandbox
-        .status
-        .as_ref()
-        .and_then(|status| status.last_token_grant_failure.as_deref())
-        .map(|observation| {
-            serde_json::json!({
-                "destination_host": observation.destination_host,
-                "destination_port": observation.destination_port,
-                "failure": observation.failure.as_ref().map(endpoint_failure_to_json),
-            })
-        });
     let admission = sandbox
         .status
         .as_ref()
@@ -3120,7 +3190,6 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
-        "last_token_grant_failure": last_token_grant_failure,
         "configuration_admission": admission,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
@@ -3178,83 +3247,6 @@ fn endpoint_result_name(result: EndpointResult) -> &'static str {
     }
 }
 
-fn endpoint_failure_domain_name(domain: i32) -> &'static str {
-    match openshell_core::proto::EndpointFailureDomain::try_from(domain) {
-        Ok(openshell_core::proto::EndpointFailureDomain::TokenGrant) => "token_grant",
-        Ok(openshell_core::proto::EndpointFailureDomain::Unspecified) | Err(_) => "unknown",
-    }
-}
-
-fn endpoint_failure_recovery_name(
-    action: openshell_core::proto::ProviderCredentialRefreshRecoveryAction,
-) -> &'static str {
-    match action {
-        // Structured output names every value; "-" is a table placeholder.
-        openshell_core::proto::ProviderCredentialRefreshRecoveryAction::Unspecified => {
-            "unspecified"
-        }
-        action => crate::commands::provider::provider_refresh_recovery_action_name(action),
-    }
-}
-
-fn endpoint_failure_to_json(failure: &openshell_core::proto::EndpointFailure) -> serde_json::Value {
-    serde_json::json!({
-        "domain": endpoint_failure_domain_name(failure.domain),
-        "code": failure.code,
-        "recovery_action": endpoint_failure_recovery_name(failure.recovery_action()),
-        "provider": failure.provider,
-        "credential_key": failure.credential_key,
-        "stage": failure.stage,
-        "upstream_http_status": failure.upstream_http_status,
-        "request_id": failure.request_id,
-    })
-}
-
-fn endpoint_failure_display_lines(failure: &openshell_core::proto::EndpointFailure) -> Vec<String> {
-    use openshell_core::proto::ProviderCredentialRefreshRecoveryAction as Recovery;
-    let upstream = failure
-        .upstream_http_status
-        .map(|status| format!(", upstream HTTP {status}"))
-        .unwrap_or_default();
-    let recovery = match failure.recovery_action() {
-        Recovery::Retry => "Retry later; the failure can be temporary.",
-        Recovery::Reauthorize => "Reauthorize the provider credential.",
-        Recovery::FixConfiguration => {
-            "An operator must fix the provider or identity configuration."
-        }
-        Recovery::Investigate => "An operator must investigate gateway and supervisor logs.",
-        Recovery::Unspecified => "No recovery action provided.",
-    };
-    let mut lines = vec![format!(
-        "Cause: {} ({}, stage {}{upstream})",
-        failure.code,
-        endpoint_failure_domain_name(failure.domain).replace('_', " "),
-        failure.stage,
-    )];
-    if !failure.provider.is_empty() {
-        lines.push(format!(
-            "Credential: {}/{}",
-            failure.provider, failure.credential_key
-        ));
-    }
-    lines.push(format!("Recovery: {recovery}"));
-    lines.push(format!("Request ID: {}", failure.request_id));
-    lines
-}
-
-fn token_grant_failure_display_lines(
-    observation: &openshell_core::proto::TokenGrantFailureObservation,
-) -> Vec<String> {
-    let mut lines = vec![format!(
-        "Destination: {} (port {})",
-        observation.destination_host, observation.destination_port
-    )];
-    if let Some(failure) = observation.failure.as_ref() {
-        lines.extend(endpoint_failure_display_lines(failure));
-    }
-    lines
-}
-
 fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
     let ports = endpoint
         .ports
@@ -3280,18 +3272,14 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
         .last_reported_time
         .as_ref()
         .map_or_else(|| "no report yet".to_string(), ToString::to_string);
-    let mut lines = vec![
+    vec![
         format!(
             "{} (ports: {ports}; path: {})",
             endpoint.host, endpoint.path
         ),
         format!("Last result: {result}"),
-    ];
-    if let Some(failure) = endpoint.last_failure.as_ref() {
-        lines.extend(endpoint_failure_display_lines(failure));
-    }
-    lines.push(format!("Reported at (gateway acceptance): {reported_at}"));
-    lines
+        format!("Reported at (gateway acceptance): {reported_at}"),
+    ]
 }
 
 fn restart_policy_name(policy: i32) -> &'static str {
@@ -5300,7 +5288,7 @@ pub async fn sandbox_upload(
 
 pub async fn sandbox_policy_set_global(
     server: &str,
-    policy_path: &str,
+    files: PolicyFiles<'_>,
     yes: bool,
     wait: bool,
     _timeout_secs: u64,
@@ -5315,8 +5303,7 @@ pub async fn sandbox_policy_set_global(
 
     confirm_global_setting_takeover("policy", yes)?;
 
-    let policy = load_sandbox_policy(Some(policy_path))?
-        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
+    let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
     let response = client
@@ -5645,14 +5632,13 @@ pub async fn sandbox_setting_delete(
 pub async fn sandbox_policy_set(
     server: &str,
     name: &str,
-    policy_path: &str,
+    files: PolicyFiles<'_>,
     wait: bool,
     timeout_secs: u64,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let policy = load_sandbox_policy(Some(policy_path))?
-        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
+    let policy = files.load()?;
 
     let mut client = grpc_client(server, tls).await?;
 
@@ -6066,8 +6052,7 @@ where
             if let Some(ref policy) = rev.policy {
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
                 writeln!(stderr, "Policy payload not available for this version")
@@ -6174,8 +6159,7 @@ where
             if view.includes_policy() {
                 writeln!(stdout, "---").into_diagnostic()?;
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             }
         }
@@ -6236,8 +6220,7 @@ pub async fn sandbox_policy_get_global(
             if let Some(ref policy) = rev.policy {
                 println!("---");
                 let policy = policy_for_view(policy, view);
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
-                    .wrap_err("failed to serialize policy to YAML")?;
+                let yaml_str = render_policy_text(policy.as_ref())?;
                 print!("{yaml_str}");
             } else {
                 eprintln!("Policy payload not available for this version");
@@ -6322,9 +6305,7 @@ fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, Sandb
     }
 
     let mut base_policy = policy.clone();
-    base_policy
-        .network_policies
-        .retain(|name, _| !openshell_policy::is_provider_rule_name(name));
+    openshell_policy::strip_provider_rule_names(&mut base_policy);
     Cow::Owned(base_policy)
 }
 
@@ -7014,14 +6995,15 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 mod tests {
     use super::{
         ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
-        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
-        parse_driver_config_json, parse_env_from_pairs, parse_secret_material_env_pairs,
+        cedar_policy_warning_lines, format_endpoint, format_log_line,
+        forward_requires_session_token, git_sync_files, has_main_process_result,
+        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
+        parse_env_from_pairs, parse_secret_material_env_pairs, policy_for_view,
         policy_revision_list_json, policy_revision_to_json, proto_execution_timeout,
         provisioning_timeout_message, ready_false_condition_message, relay_local_socket,
-        resolve_from, rootfs_tar_sources_supported_for_gateway, sandbox_should_persist,
-        sandbox_upload_plan, service_endpoint_to_json, service_status_error,
-        service_url_for_gateway, workspace_member_to_json,
+        render_policy_text, resolve_from, rootfs_tar_sources_supported_for_gateway,
+        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
+        service_status_error, service_url_for_gateway, workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
 
@@ -8783,7 +8765,6 @@ mod tests {
                     path: "/mcp".to_string(),
                     last_result: EndpointResult::TransportFailed as i32,
                     last_reported_time: Some("2026-09-05T10:01:00Z".parse().unwrap()),
-                    last_failure: None,
                 }],
                 conditions: vec![SandboxCondition {
                     r#type: "Ready".to_string(),
@@ -8831,7 +8812,6 @@ mod tests {
                     "path": "/mcp",
                     "last_result": "TransportFailed",
                     "last_reported_at": "2026-09-05T10:01:00Z",
-                    "last_failure": null,
                 }])
             );
         }
@@ -8846,7 +8826,6 @@ mod tests {
             path: "/mcp".to_string(),
             last_result: EndpointResult::TransportFailed as i32,
             last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
-            last_failure: None,
         };
 
         assert_eq!(
@@ -8868,7 +8847,6 @@ mod tests {
             path: "/**".to_string(),
             last_result: EndpointResult::NoObservedExchange as i32,
             last_reported_time: None,
-            last_failure: None,
         };
 
         assert_eq!(
@@ -8896,89 +8874,9 @@ mod tests {
                 "path": "/**",
                 "last_result": "NoObservedExchange",
                 "last_reported_at": "",
-                "last_failure": null,
             }])
         );
         assert_eq!(output["conditions"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn token_grant_failure_renders_in_text_and_structured_output() {
-        use openshell_core::proto::{
-            EndpointFailure, EndpointFailureDomain, ProviderCredentialRefreshRecoveryAction,
-            TokenGrantFailureObservation,
-        };
-        let failure = EndpointFailure {
-            domain: EndpointFailureDomain::TokenGrant.into(),
-            code: "provider_authorization_required".to_string(),
-            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize.into(),
-            provider: "github".to_string(),
-            credential_key: "access_token".to_string(),
-            stage: "token_endpoint".to_string(),
-            upstream_http_status: Some(409),
-            request_id: "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908".to_string(),
-        };
-        let endpoint = EndpointStatus {
-            host: "tools.example.test".to_string(),
-            last_failure: Some(failure.clone()),
-            ..Default::default()
-        };
-        let observation = TokenGrantFailureObservation {
-            destination_host: "api.example.test".to_string(),
-            destination_port: 8443,
-            failure: Some(failure),
-        };
-        let cause = [
-            "Cause: provider_authorization_required (token grant, stage token_endpoint, upstream HTTP 409)",
-            "Credential: github/access_token",
-            "Recovery: Reauthorize the provider credential.",
-            "Request ID: 7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
-        ];
-        // MCP endpoint status places the cause between the result and report time.
-        let endpoint_lines = super::endpoint_status_display_lines(&endpoint);
-        assert_eq!(endpoint_lines[2..6], cause);
-        assert!(endpoint_lines[6].starts_with("Reported at"));
-        assert_eq!(
-            super::token_grant_failure_display_lines(&observation),
-            [&["Destination: api.example.test (port 8443)"][..], &cause].concat()
-        );
-
-        let output = super::sandbox_to_json(&Sandbox {
-            status: Some(SandboxStatus {
-                endpoint_statuses: vec![endpoint],
-                last_token_grant_failure: Some(Box::new(observation)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let failure_json = serde_json::json!({
-            "domain": "token_grant",
-            "code": "provider_authorization_required",
-            "recovery_action": "reauthorize",
-            "provider": "github",
-            "credential_key": "access_token",
-            "stage": "token_endpoint",
-            "upstream_http_status": 409,
-            "request_id": "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
-        });
-        assert_eq!(output["endpoint_statuses"][0]["last_failure"], failure_json);
-        assert_eq!(
-            output["last_token_grant_failure"],
-            serde_json::json!({
-                "destination_host": "api.example.test",
-                "destination_port": 8443,
-                "failure": failure_json,
-            })
-        );
-        assert!(super::sandbox_to_json(&Sandbox::default())["last_token_grant_failure"].is_null());
-
-        let unknown = super::endpoint_failure_to_json(&EndpointFailure {
-            domain: 99,
-            recovery_action: 99,
-            ..Default::default()
-        });
-        assert_eq!(unknown["domain"], "unknown");
-        assert_eq!(unknown["recovery_action"], "unspecified");
     }
 
     #[test]
@@ -9352,5 +9250,148 @@ mod tests {
         assert!(!forward_requires_session_token(&Status::permission_denied(
             "authorization_token is required for ForwardTcp"
         )));
+    }
+
+    #[test]
+    fn cedar_policy_warning_lines_report_an_audit_only_path_beside_enforced_policies() {
+        let http = |annotations: &str, effect: &str, condition: &str| {
+            format!(
+                "{annotations}\n{effect} (principal, action == Sandbox::Action::\"HttpRequest\", \
+                 resource == Sandbox::NetworkEndpoint::\"api.example.com:443\")\nwhen {{ {condition} }};\n"
+            )
+        };
+        let trap = format!(
+            "{}{}",
+            http("", "permit", "context.method == \"GET\""),
+            http(
+                "@path(\"/admin/**\") @enforcement(\"audit\")",
+                "forbid",
+                "context.method == \"DELETE\""
+            ),
+        );
+        let policy = SandboxPolicy {
+            version: 1,
+            cedar_policy_source: trap,
+            ..Default::default()
+        };
+        let warnings = cedar_policy_warning_lines(&policy);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("path `/admin/**` of api.example.com:443 is audit-only"),
+            "{}",
+            warnings[0]
+        );
+
+        let enforced = SandboxPolicy {
+            version: 1,
+            cedar_policy_source: http("", "permit", "context.method == \"GET\""),
+            ..Default::default()
+        };
+        assert!(cedar_policy_warning_lines(&enforced).is_empty());
+        assert!(cedar_policy_warning_lines(&SandboxPolicy::default()).is_empty());
+    }
+
+    #[test]
+    fn render_policy_text_shows_cedar_text_then_middleware() {
+        let source = "permit (principal, action == Sandbox::Action::\"NetworkConnect\", \
+                      resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");";
+        let mut policy = SandboxPolicy {
+            version: 1,
+            cedar_policy_source: source.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(render_policy_text(&policy).expect("render"), source);
+
+        policy.network_middlewares.insert(
+            "guard".to_string(),
+            openshell_core::proto::NetworkMiddlewareConfig {
+                middleware: "openshell/regex".to_string(),
+                order: 10,
+                ..Default::default()
+            },
+        );
+        let rendered = render_policy_text(&policy).expect("render");
+        let (cedar, middleware) = rendered
+            .split_once("---\n")
+            .expect("middleware is a separate section");
+        assert_eq!(cedar.trim_end(), source);
+        assert!(middleware.contains("network_middlewares:"), "{middleware}");
+        assert!(middleware.contains("guard"), "{middleware}");
+
+        policy
+            .endpoint_settings
+            .push(openshell_core::proto::NetworkEndpoint {
+                host: "pypi.org".to_string(),
+                port: 443,
+                ports: vec![443],
+                allow_encoded_slash: true,
+                ..Default::default()
+            });
+        let rendered = render_policy_text(&policy).expect("render");
+        let (_, settings) = rendered
+            .split_once("---\n")
+            .expect("middleware is a separate section");
+        assert!(settings.contains("endpoint_settings:"), "{settings}");
+        assert!(settings.contains("allow_encoded_slash: true"), "{settings}");
+        let reparsed = openshell_policy::parse_middleware_yaml(
+            settings
+                .split_once('\n')
+                .map(|(_, body)| body)
+                .expect("heading line"),
+        )
+        .expect("the rendered section is a middleware file");
+        assert_eq!(reparsed.endpoint_settings, policy.endpoint_settings);
+
+        policy.process = Some(openshell_core::proto::ProcessPolicy {
+            run_as_user: "1000".to_string(),
+            run_as_group: "sandbox".to_string(),
+        });
+        let rendered = render_policy_text(&policy).expect("render");
+        let (cedar, section) = rendered
+            .split_once("---\n")
+            .expect("middleware is a separate section");
+        assert_eq!(
+            cedar.trim_end(),
+            source,
+            "process stays out of the Cedar text"
+        );
+        assert!(section.contains("process:"), "{section}");
+        assert!(section.contains("run_as_user: \"1000\""), "{section}");
+        let reparsed = openshell_policy::parse_middleware_yaml(
+            section
+                .split_once('\n')
+                .map(|(_, body)| body)
+                .expect("heading line"),
+        )
+        .expect("the rendered section is a middleware file");
+        assert_eq!(reparsed.process, policy.process);
+
+        policy.provider_credential_rules.insert(
+            "_provider_work".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    provider_credentialed: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let full = render_policy_text(&policy_for_view(&policy, PolicyGetView::Full))
+            .expect("render full view");
+        let sections: Vec<&str> = full.split("---\n").collect();
+        assert_eq!(sections.len(), 3, "{full}");
+        assert!(
+            sections[2].contains("# Credentialed endpoints: pypi.org:443"),
+            "{full}"
+        );
+        assert!(sections[2].contains("_provider_work"), "{full}");
+
+        let base = render_policy_text(&policy_for_view(&policy, PolicyGetView::Base))
+            .expect("render base view");
+        assert!(!base.contains("provider_credential_rules"), "{base}");
+        assert!(base.contains("network_middlewares:"), "{base}");
     }
 }

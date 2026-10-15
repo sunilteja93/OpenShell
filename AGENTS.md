@@ -31,6 +31,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
+| `crates/openshell-policy-cedar/` | Cedar policy engine | Validation, Landlock/L7/DNS derivation, and evaluation for Cedar-authored sandbox policies |
+| `crates/openshell-policy-cedar-schema/` | Cedar policy schema | Canonical Cedar schema and entity, action, and context names |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
@@ -226,7 +228,7 @@ When behavior, commands, or development workflows change, review the related age
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
 ## Terminology

@@ -20,7 +20,6 @@ pub mod dynamic_credential_key;
 pub mod dynamic_string_allowlist;
 #[cfg(unix)]
 pub mod e2fsprogs;
-pub mod endpoint_failure;
 pub mod endpoint_path;
 pub mod endpoint_status;
 pub mod error;
@@ -62,7 +61,6 @@ pub mod shell;
 pub mod spiffe;
 pub mod telemetry;
 pub mod time;
-pub mod token_grant_failure;
 pub mod transport_errors;
 pub mod upload;
 
