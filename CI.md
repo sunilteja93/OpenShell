@@ -19,38 +19,21 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 ### Nix cache access
 
-PR, merge-group, scan, and release jobs read the public `openshell` Cachix cache
-without a write credential. The shared `setup-nix` action always disables uploads.
-`Populate Nix Cache` populates the default development shell and VM runtime for
-Linux x86-64, Linux ARM64, and macOS ARM64 after pushes to `main`. It checks out
-the triggering commit on fresh GitHub-hosted runners and uses the `cachix-write`
-environment. Cache misses still build locally; cache population is independent
-of the release and PR gates.
+All CI jobs use the public `openshell` Cachix cache read-only. `Populate Nix
+Cache` is the sole writer and runs on GitHub-hosted runners after pushes to `main`.
 
 Before enabling cache writes, a repository administrator must:
 
 1. Revoke the old Cachix write token and remove `CACHIX_AUTH_TOKEN` from
-   repository secrets and organization secrets available to this repository.
-   Audit cache uploads made with that token and invalidate untrusted entries.
-2. Create the `cachix-write` environment. Under **Deployment branches and tags**,
-   choose **Selected branches and tags** and allow only the exact branch `main`,
-   with no tag rules. Protect `main` from unreviewed changes and disable
-   administrator bypass of the environment rules.
-3. Only after those restrictions are saved, add a new, `openshell`-scoped Cachix
-   write token as the environment secret `CACHIX_WRITE_TOKEN`. Neither token
-   name may hold a write credential at repository or organization scope. Keep
-   cache writes disabled until this migration is complete.
+   repository and organization secrets; audit its uploads and invalidate
+   untrusted entries.
+2. Create the `cachix-write` environment, restrict it to the exact protected
+   `main` branch with no tag rules or administrator bypass, then add a fresh
+   `CACHIX_WRITE_TOKEN` only to that environment.
 
-These settings are part of the security boundary. Mirrored PRs can change
-workflow YAML, so a workflow condition cannot protect a repository secret.
-GitHub enforces [environment branch restrictions](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
-outside that YAML. A workflow referencing a nonexistent environment creates it
-without protection rules; the workflow does not configure these restrictions.
-The cache writer fails if its environment credential is missing. This isolation
-applies to Cachix; other CI credentials need their own access controls.
-
-Run `mise run test:cachix-isolation` to check the workflow wiring locally.
-The test does not verify live environment settings or token permissions.
+Mirrored PRs can edit workflow YAML, so the GitHub [environment restriction](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+is the security boundary. Keep writes disabled until this migration is complete.
+`mise run test:cachix-isolation` checks source wiring, not GitHub settings.
 
 ### Protobuf API compatibility
 
