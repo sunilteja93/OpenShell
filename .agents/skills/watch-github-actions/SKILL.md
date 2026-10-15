@@ -148,9 +148,7 @@ not from the candidate under scan.
 `setup-nix` always uses read-only Cachix access. `Populate Nix Cache` is the only
 cache writer and runs after pushes to `main`. If it fails because its credential
 is missing, follow the environment setup in `CI.md#nix-cache-access`; never add
-a Cachix write token to repository or organization secrets. PR and release jobs
-build cache misses locally. `mise run test:cachix-isolation` checks the source
-wiring, not the environment restrictions configured in GitHub.
+a Cachix write token to repository or organization secrets.
 
 `setup-nix` retries development-shell preparation once when `prepare-shell`
 is enabled. Inspect both attempts in the job log; `setup-rust` assumes the

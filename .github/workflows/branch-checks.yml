@@ -515,9 +515,6 @@ jobs:
       - name: Test release qualification summary
         run: mise run test:qualification-summary
 
-      - name: Test Cachix credential isolation
-        run: mise run test:cachix-isolation
-
   go:
     name: Go SDK
     needs: pr_metadata

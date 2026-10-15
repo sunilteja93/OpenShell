@@ -33,7 +33,6 @@ Before enabling cache writes, a repository administrator must:
 
 Mirrored PRs can edit workflow YAML, so the GitHub [environment restriction](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 is the security boundary. Keep writes disabled until this migration is complete.
-`mise run test:cachix-isolation` checks source wiring, not GitHub settings.
 
 ### Protobuf API compatibility
 
