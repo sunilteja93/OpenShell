@@ -335,11 +335,12 @@ async fn profile_scope(
 }
 
 macro_rules! mutation {
-    ($req:ty, $resp:ty, $method:literal, $handler:path, $auth:expr, $capture:expr, $restore:expr) => {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $auth:expr, $capture:expr, $restore:expr $(, $replay_method:literal)?) => {
         #[tonic::async_trait]
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;
+            $(const REPLAY_METHOD: &'static str = $replay_method;)?
             const PROTECTED: bool = true;
             fn request_id(&self) -> &str {
                 &self.request_id
@@ -390,7 +391,7 @@ macro_rules! scoped_mutation {
 }
 
 macro_rules! sandbox_scoped_mutation {
-    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr) => {
+    ($req:ty, $resp:ty, $method:literal, $handler:path, $role:ident, $capture:expr, $restore:expr $(, $replay_method:literal)?) => {
         mutation!(
             $req,
             $resp,
@@ -407,6 +408,7 @@ macro_rules! sandbox_scoped_mutation {
             },
             $capture,
             $restore
+            $(, $replay_method)?
         );
     };
 }
@@ -424,7 +426,7 @@ fn sandbox_receipt(
 }
 
 macro_rules! sandbox_mutation {
-    ($req:ty, $method:literal, $handler:path) => {
+    ($req:ty, $method:literal, $handler:path $(, $replay_method:literal)?) => {
         sandbox_scoped_mutation!(
             $req,
             SandboxResponse,
@@ -445,6 +447,7 @@ macro_rules! sandbox_mutation {
                     service_urls: HashMap::new(),
                 })
             }
+            $(, $replay_method)?
         );
     };
 }
@@ -475,7 +478,8 @@ scoped_mutation!(
 sandbox_mutation!(
     openshell_core::proto::UpdateSandboxRequest,
     "UpdateSandbox",
-    sandbox::handle_update_sandbox
+    sandbox::handle_update_sandbox,
+    "/openshell.v1.SandboxUpdates/UpdateSandbox"
 );
 sandbox_mutation!(
     StartSandboxRequest,
