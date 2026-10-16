@@ -697,6 +697,21 @@ certManager:
   certificateDuration: 8760h
   # -- Renewal window for cert-manager-issued certificates.
   certificateRenewBefore: 720h
+  # Optional, separate client identity for gateway-wide mTLS administration.
+  operatorClient:
+    # -- Issue a client certificate with exact OU=operator. Requires certManager,
+    # TLS, and client verification using the chart CA. Does not enable gateway
+    # operator authentication; set gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled.
+    enabled: false
+    # -- Common name for the operator identity.
+    commonName: platform-operator
+    # -- Dedicated operator TLS Secret. Empty uses `<fullname>-operator-client-tls`.
+    # Never reuse a server, ordinary client, CA, or sandbox JWT Secret.
+    secretName: ""
+    # -- Operator certificate lifetime. Empty inherits certManager.certificateDuration.
+    duration: ""
+    # -- Operator renewal window. Empty inherits certManager.certificateRenewBefore.
+    renewBefore: ""
   # -- DNS SANs on the cert-manager-issued server certificate.
   serverDnsNames:
     - openshell

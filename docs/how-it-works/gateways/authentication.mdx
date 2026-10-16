@@ -95,6 +95,62 @@ setting.
 See [Providers](/how-it-works/providers/overview#retrieve-runtime-credentials)
 for the credential retrieval contract.
 
+#### Issue an operator certificate with Helm and cert-manager
+
+With cert-manager installed, opt in to a separate operator certificate and
+enable gateway operator authentication:
+
+```yaml
+certManager:
+  enabled: true
+  operatorClient:
+    enabled: true
+    commonName: platform-operator
+    secretName: openshell-operator-client-tls
+    duration: 168h
+    renewBefore: 24h
+
+gatewayConfig:
+  openshell.gateway.mtls_auth:
+    operator_enabled: true
+```
+
+The certificate has exact `OU=operator` and uses the chart CA, including when
+`certManager.serverIssuerRef` selects a different external server issuer.
+Keep TLS and client verification enabled. The gateway must trust the chart CA:
+use the default `certManager.clientCaFromServerTlsSecret: true`, or set it to
+`false` and set `server.tls.clientCaSecretName` to `certManager.caSecretName`.
+Issuance alone does not enable operator authentication. This setting is
+independent of the Kubernetes driver's `workspaceMode: operator`.
+
+Restrict access to the operator Secret and permission to issue certificates
+under the chart CA. The chart does not mount the operator Secret into gateway,
+supervisor, or workload pods. Ordinary client certificates remain unchanged.
+
+For a release named `openshell` in namespace `openshell`, wait for issuance and
+extract a separate CLI identity. These commands use the default XDG config path:
+
+```shell
+kubectl -n openshell wait certificate/openshell-operator-client --for=condition=Ready --timeout=120s
+umask 077
+mkdir -p ~/.config/openshell/gateways/openshell-operator/mtls
+kubectl -n openshell get secret openshell-operator-client-tls -o jsonpath='{.data.tls\.crt}' | base64 --decode > ~/.config/openshell/gateways/openshell-operator/mtls/tls.crt
+kubectl -n openshell get secret openshell-operator-client-tls -o jsonpath='{.data.tls\.key}' | base64 --decode > ~/.config/openshell/gateways/openshell-operator/mtls/tls.key
+kubectl -n openshell get secret openshell-server-tls -o jsonpath='{.data.ca\.crt}' | base64 --decode > ~/.config/openshell/gateways/openshell-operator/mtls/ca.crt
+openshell gateway add https://localhost:8090 --local --name openshell-operator
+```
+
+The endpoint above assumes an active port-forward to the gateway Service on
+port 8090. Use your direct gateway endpoint and a hostname covered by its server
+certificate. The CLI's `ca.crt` verifies the **server**: when using an external
+server certificate, use that issuer's server trust bundle instead of the chart
+CA. Do not register this operator identity with OIDC or edge authentication.
+
+cert-manager renews the Kubernetes Secret automatically. Exported CLI files do
+not update automatically; copy the renewed certificate and key again and
+reconnect. An empty `duration` or `renewBefore` inherits
+`certManager.certificateDuration` or `certManager.certificateRenewBefore`.
+
 ### Inspect the API with grpcurl
 
 The primary gateway listener serves the gRPC reflection v1 protocol. Reflection

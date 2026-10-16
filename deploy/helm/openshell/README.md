@@ -344,6 +344,14 @@ sandbox JWT signing Secret. This precedence applies even if
 external non-cert-manager TLS source manages TLS and you pre-create the sandbox
 JWT signing Secret.
 
+For a separate cert-manager-issued mTLS operator identity, opt in with
+`certManager.operatorClient.enabled=true` and enable authorization separately
+with `gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled=true`.
+The certificate uses the chart CA and exact `OU=operator`; its dedicated Secret
+is not mounted into gateway or sandbox pods. See the published
+[operator certificate setup](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/authentication#issue-an-operator-certificate-with-helm-and-cert-manager)
+for trust requirements, CLI extraction, and renewal handling.
+
 ## SPIFFE/SPIRE provider token grants
 
 Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
@@ -382,6 +390,11 @@ discovery endpoint or its TLS CA.
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
 | certManager.clientCaFromServerTlsSecret | bool | `true` | Mount gateway client CA from the internal server TLS secret's ca.crt. The internal server certificate is always signed by the chart CA — the same CA that signs the client (mTLS) certificate — so the default (true) is correct for all configurations, including when serverIssuerRef is set. Only set to false if you mount the client CA from a separate secret via server.tls.clientCaSecretName. |
 | certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources. When enabled, cert-manager owns TLS and the chart runs a JWT-only certgen hook to create the sandbox JWT signing Secret that cert-manager does not manage. |
+| certManager.operatorClient.commonName | string | `"platform-operator"` | Common name for the operator identity. |
+| certManager.operatorClient.duration | string | `""` | Operator certificate lifetime. Empty inherits certManager.certificateDuration. |
+| certManager.operatorClient.enabled | bool | `false` | Issue a client certificate with exact OU=operator. Requires certManager, TLS, and client verification using the chart CA. Does not enable gateway operator authentication; set gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled. |
+| certManager.operatorClient.renewBefore | string | `""` | Operator renewal window. Empty inherits certManager.certificateRenewBefore. |
+| certManager.operatorClient.secretName | string | `""` | Dedicated operator TLS Secret. Empty uses `<fullname>-operator-client-tls`. Never reuse a server, ordinary client, CA, or sandbox JWT Secret. |
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real LetsEncrypt/ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |

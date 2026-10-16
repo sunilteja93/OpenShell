@@ -345,6 +345,14 @@ sandbox JWT signing Secret. This precedence applies even if
 external non-cert-manager TLS source manages TLS and you pre-create the sandbox
 JWT signing Secret.
 
+For a separate cert-manager-issued mTLS operator identity, opt in with
+`certManager.operatorClient.enabled=true` and enable authorization separately
+with `gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled=true`.
+The certificate uses the chart CA and exact `OU=operator`; its dedicated Secret
+is not mounted into gateway or sandbox pods. See the published
+[operator certificate setup](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/authentication#issue-an-operator-certificate-with-helm-and-cert-manager)
+for trust requirements, CLI extraction, and renewal handling.
+
 ## SPIFFE/SPIRE provider token grants
 
 Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`

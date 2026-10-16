@@ -150,6 +150,22 @@ deploy:
           sandboxRuntime.image.tag: '{{.IMAGE_TAG_openshell_sandbox}}'
           gatewayConfig.openshell\.drivers\.kubernetes.supervisor_image: '{{.IMAGE_REPO_openshell_supervisor}}:{{.IMAGE_TAG_openshell_supervisor}}'
 profiles:
+  - name: cert-manager-operator
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0
+        value:
+          name: cert-manager
+          remoteChart: oci://quay.io/jetstack/charts/cert-manager
+          version: v1.20.2
+          namespace: cert-manager
+          createNamespace: true
+          wait: true
+          setValues:
+            crds.enabled: true
+      - op: add
+        path: /deploy/helm/releases/1/valuesFiles/-
+        value: ci/values-cert-manager-operator.yaml
   # Full HA test path: installs Envoy Gateway and layers both HA replicas and
   # Gateway API routing values onto the OpenShell release.
   - name: high-availability

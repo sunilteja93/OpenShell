@@ -77,4 +77,24 @@ grep -F 'external_cert_path = "/etc/openshell-tls/server-external/tls.crt"' "${r
 grep -F 'external_key_path = "/etc/openshell-tls/server-external/tls.key"' "${route_toml}" >/dev/null
 grep -F 'external_server_names = ["openshell.example.com"]' "${route_toml}" >/dev/null
 
+# Operator issuance is a distinct identity and must not change ordinary clients
+# or make the operator private key available through workload mounts or RBAC.
+render operator-client --values "${chart}/ci/values-cert-manager-operator.yaml"
+operator_manifest="${work_dir}/operator-client.yaml"
+operator_toml="${work_dir}/operator-client.toml"
+toml "${operator_manifest}" "${operator_toml}"
+operator_secret="$(yq ea -e -r 'select(.kind == "Certificate" and .spec.subject.organizationalUnits[0] == "operator") | .spec.secretName' "${operator_manifest}")"
+[[ "${operator_secret}" == "resource-coherence-openshell-operator-client-tls" ]]
+[[ "$(yq ea -e -r 'select(.kind == "Certificate" and .spec.secretName == "openshell-client-tls") | .spec.subject.organizationalUnits // [] | length' "${operator_manifest}")" == "0" ]]
+grep -F '[openshell.gateway.mtls_auth]' "${operator_toml}" >/dev/null
+grep -F 'operator_enabled = true' "${operator_toml}" >/dev/null
+if workload_value "${operator_manifest}" '.spec.template.spec.volumes[]?.secret.secretName' | grep -Fxq "${operator_secret}"; then
+  echo "gateway must not mount the operator Secret" >&2
+  exit 1
+fi
+if yq ea -r 'select(.kind == "Role" or .kind == "ClusterRole") | .rules[]?.resourceNames[]?' "${operator_manifest}" | grep -Fxq "${operator_secret}"; then
+  echo "runtime RBAC must not grant access to the operator Secret" >&2
+  exit 1
+fi
+
 echo "gateway Service, TLS, PKI, Route, workload, and runtime config are coherent"

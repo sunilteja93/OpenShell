@@ -752,6 +752,17 @@ If the gateway pod is pending with `MountVolume.SetUp failed for volume
 `templates/certgen.yaml` output and the hook Job logs; cert-manager creates TLS
 Secrets but does not create the sandbox JWT signing Secret.
 
+For cert-manager-issued operator identities, `certManager.operatorClient.enabled`
+opts in to a separate `<fullname>-operator-client-tls` Secret (or the configured
+`operatorClient.secretName`) with exact `OU=operator`. Authorization still needs
+`gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled=true` and direct
+mTLS. The gateway must trust the chart CA, through the shared server TLS CA or
+`server.tls.clientCaSecretName=certManager.caSecretName`. Check the
+`<fullname>-operator-client` Certificate's Ready condition and the operator
+Secret's subject and expiry. This Secret must not be mounted into gateway,
+supervisor, or workload pods. Exported CLI certificate/key files need refreshing
+after cert-manager renewal; see the published gateway authentication guide.
+
 If the gateway exits with `failed to read sandbox JWT signing key from
 /etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains
 `signing.pem`, `public.pem`, and `kid`, and that the gateway workload mounts the

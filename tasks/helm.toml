@@ -75,6 +75,10 @@ description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
 dir = "deploy/helm/openshell"
 run = "skaffold dev"
 
+["helm:test:operator-mtls"]
+description = "Test a live cert-manager operator profile through a direct gateway port-forward"
+run = "bash deploy/helm/test-operator-client-mtls.sh"
+
 ["helm:skaffold:run"]
 description = "Run a one-shot Skaffold deploy and register its local plaintext gateway"
 dir = "deploy/helm/openshell"

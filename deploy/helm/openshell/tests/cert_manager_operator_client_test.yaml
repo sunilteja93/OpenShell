@@ -1,0 +1,163 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cert-manager operator client identity
+templates:
+  - templates/cert-manager-operator-client.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: issues no operator certificate by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: requires explicit opt-in even with cert-manager enabled
+    set:
+      certManager.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: issues a separate operator identity with the chart CA and shared lifetime
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+      - equal:
+          path: spec.secretName
+          value: openshell-operator-client-tls
+      - equal:
+          path: spec.commonName
+          value: platform-operator
+      - equal:
+          path: spec.subject.organizationalUnits
+          value: [operator]
+      - equal:
+          path: spec.usages
+          value: [client auth, digital signature, key encipherment]
+      - equal:
+          path: spec.issuerRef
+          value:
+            name: openshell-ca-issuer
+            kind: Issuer
+            group: cert-manager.io
+      - equal:
+          path: spec.duration
+          value: 8760h
+      - equal:
+          path: spec.renewBefore
+          value: 720h
+
+  - it: supports a dedicated name and lifetime without using the external server issuer
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      certManager.operatorClient.commonName: release-operator
+      certManager.operatorClient.secretName: release-operator-tls
+      certManager.operatorClient.duration: 168h
+      certManager.operatorClient.renewBefore: 24h
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames: [openshell.example.com]
+    asserts:
+      - equal:
+          path: spec.commonName
+          value: release-operator
+      - equal:
+          path: spec.secretName
+          value: release-operator-tls
+      - equal:
+          path: spec.duration
+          value: 168h
+      - equal:
+          path: spec.renewBefore
+          value: 24h
+      - equal:
+          path: spec.issuerRef.name
+          value: openshell-ca-issuer
+
+  - it: accepts the chart CA Secret as an explicit client trust source
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+      server.tls.clientCaSecretName: openshell-ca-tls
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: rejects issuance without cert-manager
+    set:
+      certManager.operatorClient.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: certManager.operatorClient.enabled requires certManager.enabled=true
+
+  - it: rejects plaintext gateways
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.operatorClient.enabled requires TLS and client certificate verification (server.disableTls=false, server.tls.enableMtls=true, and a non-empty server.tls.clientCaSecretName)"
+
+  - it: rejects disabled client certificate verification
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      server.tls.enableMtls: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.operatorClient.enabled requires TLS and client certificate verification (server.disableTls=false, server.tls.enableMtls=true, and a non-empty server.tls.clientCaSecretName)"
+
+  - it: rejects an empty client CA Secret
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.operatorClient.enabled requires TLS and client certificate verification (server.disableTls=false, server.tls.enableMtls=true, and a non-empty server.tls.clientCaSecretName)"
+
+  - it: rejects a different client trust source
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+      server.tls.clientCaSecretName: other-ca
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.operatorClient.enabled requires the gateway to trust the chart CA: set certManager.clientCaFromServerTlsSecret=true or server.tls.clientCaSecretName=certManager.caSecretName"
+
+  - it: rejects reusing the ordinary client Secret
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      certManager.operatorClient.secretName: openshell-client-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.operatorClient.secretName must be a dedicated Secret, distinct from server, ordinary client, CA, and sandbox JWT Secrets"
+
+  - it: rejects reusing the CA Secret
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      certManager.operatorClient.secretName: openshell-ca-tls
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.operatorClient.secretName must be a dedicated Secret, distinct from server, ordinary client, CA, and sandbox JWT Secrets"
+
+  - it: requires a non-empty common name
+    set:
+      certManager.enabled: true
+      certManager.operatorClient.enabled: true
+      certManager.operatorClient.commonName: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: certManager.operatorClient.commonName must not be empty

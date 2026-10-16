@@ -1,0 +1,44 @@
+{{- if .Values.certManager.operatorClient.enabled }}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- if not .Values.certManager.enabled }}
+{{- fail "certManager.operatorClient.enabled requires certManager.enabled=true" }}
+{{- end }}
+{{- if ne (include "openshell.gatewayClientCaEnabled" .) "true" }}
+{{- fail "certManager.operatorClient.enabled requires TLS and client certificate verification (server.disableTls=false, server.tls.enableMtls=true, and a non-empty server.tls.clientCaSecretName)" }}
+{{- end }}
+{{- if and (not .Values.certManager.clientCaFromServerTlsSecret) (ne .Values.server.tls.clientCaSecretName .Values.certManager.caSecretName) }}
+{{- fail "certManager.operatorClient.enabled requires the gateway to trust the chart CA: set certManager.clientCaFromServerTlsSecret=true or server.tls.clientCaSecretName=certManager.caSecretName" }}
+{{- end }}
+{{- $secretName := .Values.certManager.operatorClient.secretName | default (printf "%s-operator-client-tls" (include "openshell.fullname" .)) }}
+{{- $reservedSecrets := list .Values.server.tls.certSecretName .Values.server.tls.clientTlsSecretName .Values.server.tls.clientCaSecretName .Values.certManager.caSecretName (include "openshell.sandboxJwtSecretName" .) (printf "%s-server-external-tls" (include "openshell.fullname" .)) }}
+{{- if has $secretName $reservedSecrets }}
+{{- fail "certManager.operatorClient.secretName must be a dedicated Secret, distinct from server, ordinary client, CA, and sandbox JWT Secrets" }}
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "openshell.fullname" . }}-operator-client
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $secretName | quote }}
+  duration: {{ .Values.certManager.operatorClient.duration | default .Values.certManager.certificateDuration | quote }}
+  renewBefore: {{ .Values.certManager.operatorClient.renewBefore | default .Values.certManager.certificateRenewBefore | quote }}
+  commonName: {{ required "certManager.operatorClient.commonName must not be empty" .Values.certManager.operatorClient.commonName | quote }}
+  subject:
+    organizationalUnits:
+      - operator
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - client auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ include "openshell.fullname" . }}-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+{{- end }}

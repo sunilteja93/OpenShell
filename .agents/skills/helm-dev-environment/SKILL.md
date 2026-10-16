@@ -329,6 +329,35 @@ Key Helm values:
 - `pkiInitJob.timeoutSeconds`: polling duration for cert-manager mode
 - `pkiInitJob.failOnTimeout`: fail install if cert-manager times out
 
+### cert-manager operator mTLS
+
+Use the `cert-manager-operator` Skaffold profile to install cert-manager and
+exercise a separate operator client certificate with direct gateway TLS:
+
+```bash
+cd deploy/helm/openshell
+KUBECONFIG=../../../kubeconfig skaffold run -p cert-manager-operator
+```
+
+The profile enables `certManager.operatorClient.enabled` and
+`gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled`, overriding the
+plaintext Skaffold default. Wait for `certificate/openshell-operator-client`
+to become Ready. Extract `tls.crt` and `tls.key` from
+`openshell-operator-client-tls` into a separate CLI gateway identity; use the
+server trust CA for its `ca.crt`. See the published gateway authentication
+guide for the extraction commands and renewal handling. Test through a direct
+Service port-forward, without OIDC/edge bearer headers. Ordinary client
+certificates must not authorize `GetProviderCredentials`; repeat with
+`operator_enabled=false` to verify that operator access is disabled.
+
+With a direct Service port-forward on localhost:8090 and `grpcurl`, `jq`, and
+OpenSSL installed, run `mise run helm:test:operator-mtls`. It checks the issued
+subject/trust chain and retrieves only a synthetic credential from a temporary
+provider/profile, which it removes afterward. After disabling operator auth,
+run `OPENSHELL_OPERATOR_AUTH_ENABLED=false mise run helm:test:operator-mtls`
+to check rejection of both operator and ordinary clients. Re-enable operator
+auth afterward if continuing development with this profile.
+
 ### Keycloak OIDC
 
 Initial setup — rerun it whenever you want to rotate the development CA:
@@ -447,7 +476,8 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/skaffold.yaml` | Skaffold config — images, Helm releases, values overlays |
 | `deploy/helm/openshell/values.yaml` | Default Helm values |
 | `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
-| `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
+| `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; certgen runs in JWT-only mode) |
+| `deploy/helm/openshell/ci/values-cert-manager-operator.yaml` | Separate cert-manager operator client identity and explicit gateway operator authentication |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
