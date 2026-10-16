@@ -60,6 +60,24 @@ The chart also runs a pre-install hook in JWT-only mode to create the gateway's
 sandbox JWT signing Secret. That Secret is separate from the cert-manager TLS
 certificate Secrets and is mounted at `/etc/openshell-jwt`.
 
+## Issue an operator client certificate
+
+Set `certManager.operatorClient.enabled=true` to issue a separate client
+certificate with exact `OU=operator`. Enable gateway operator authentication
+separately with
+`gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled=true`.
+Ordinary client certificates do not gain operator privileges.
+
+The operator certificate always uses the chart CA, including when an external
+server issuer is configured. Keep gateway client verification enabled and
+configured to trust that CA. Restrict access to the dedicated operator Secret;
+the chart does not mount it into gateway, supervisor, or workload pods.
+
+See [operator certificate setup](/how-it-works/gateways/authentication#issue-an-operator-certificate-with-helm-and-cert-manager)
+for configurable identity and lifetime values, CLI credential extraction, and
+server trust requirements. cert-manager renews the Secret automatically, but
+exported CLI certificate and key files must be refreshed after renewal.
+
 ## Using a real Issuer for the server certificate
 
 By default, cert-manager issues both the server and client certificates from
